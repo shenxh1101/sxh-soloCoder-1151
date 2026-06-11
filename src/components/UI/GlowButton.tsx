@@ -5,7 +5,7 @@ interface GlowButtonProps {
   children: React.ReactNode;
   onClick?: () => void;
   variant?: 'primary' | 'secondary' | 'success' | 'warning' | 'danger';
-  size?: 'sm' | 'md' | 'lg';
+  size?: 'xs' | 'sm' | 'md' | 'lg';
   disabled?: boolean;
   active?: boolean;
   className?: string;
@@ -39,6 +39,7 @@ export const GlowButton: React.FC<GlowButtonProps> = ({
   };
 
   const sizeStyles = {
+    xs: 'px-1.5 py-0.5 text-[10px] gap-1',
     sm: 'px-2 py-1 text-xs gap-1',
     md: 'px-4 py-2 text-sm gap-2',
     lg: 'px-6 py-3 text-base gap-2',

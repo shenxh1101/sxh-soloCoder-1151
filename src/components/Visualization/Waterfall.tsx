@@ -1,9 +1,10 @@
-import { useRef, useEffect, useMemo } from 'react';
+import { useRef, useEffect, useMemo, useState } from 'react';
 import { useTelescopeStore } from '@/store/useTelescopeStore';
-import { SPECTRUM_BIN_COUNT } from '@/data/config';
-import { valueToRGB } from '@/utils/signal';
+import { SPECTRUM_BIN_COUNT, SPECTRUM_HISTORY_LENGTH } from '@/data/config';
+import { valueToRGB, findPeakFrequency } from '@/utils/signal';
 import { GlassPanel } from '@/components/UI/GlassPanel';
-import { BarChart3 } from 'lucide-react';
+import { GlowButton } from '@/components/UI/GlowButton';
+import { BarChart3, Pause, Play, Trash2, Download, Target } from 'lucide-react';
 
 interface WaterfallProps {
   className?: string;
@@ -12,11 +13,21 @@ interface WaterfallProps {
 export function Waterfall({ className }: WaterfallProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  const [hoveredBin, setHoveredBin] = useState<number | null>(null);
+  const [hoveredTime, setHoveredTime] = useState<number | null>(null);
   
   const spectrumHistory = useTelescopeStore(state => state.spectrumHistory);
   const frequency = useTelescopeStore(state => state.frequency);
   const isRecording = useTelescopeStore(state => state.isRecording);
   const driftScanMode = useTelescopeStore(state => state.driftScanMode);
+  const waterfallPaused = useTelescopeStore(state => state.waterfallPaused);
+  const waterfallStartTime = useTelescopeStore(state => state.waterfallStartTime);
+  const pointingInfo = useTelescopeStore(state => state.pointingInfo);
+  const trackingStatus = useTelescopeStore(state => state.trackingStatus);
+  
+  const toggleWaterfallPause = useTelescopeStore(state => state.toggleWaterfallPause);
+  const clearWaterfall = useTelescopeStore(state => state.clearWaterfall);
+  const exportSpectrumData = useTelescopeStore(state => state.exportSpectrumData);
   
   const frequencyRange = useMemo(() => {
     const bandwidth = 10;
@@ -35,6 +46,19 @@ export function Waterfall({ className }: WaterfallProps) {
     return labels;
   }, [frequencyRange]);
   
+  const timeRange = useMemo(() => {
+    const timeStep = 0.05;
+    return {
+      total: SPECTRUM_HISTORY_LENGTH * timeStep,
+      step: timeStep,
+    };
+  }, []);
+  
+  const peakInfo = useMemo(() => {
+    if (spectrumHistory.length === 0 || !spectrumHistory[0]) return null;
+    return findPeakFrequency(spectrumHistory[0], frequencyRange.min, frequencyRange.max);
+  }, [spectrumHistory, frequencyRange]);
+  
   useEffect(() => {
     const canvas = canvasRef.current;
     const container = containerRef.current;
@@ -52,6 +76,8 @@ export function Waterfall({ className }: WaterfallProps) {
     if (!ctx) return;
     
     ctx.scale(dpr, dpr);
+    
+    const weather = useTelescopeStore.getState().weather;
     
     ctx.fillStyle = '#0a0e1a';
     ctx.fillRect(0, 0, rect.width, rect.height);
@@ -84,7 +110,7 @@ export function Waterfall({ className }: WaterfallProps) {
       const spectrum = spectrumHistory[row];
       for (let col = 0; col < binCount; col++) {
         const value = spectrum[col] || 0;
-        const [r, g, b] = valueToRGB(value, minVal, maxVal);
+        const [r, g, b] = valueToRGB(value, minVal, maxVal, weather);
         
         const startX = Math.floor(col * cellWidth);
         const endX = Math.floor((col + 1) * cellWidth);
@@ -115,9 +141,25 @@ export function Waterfall({ className }: WaterfallProps) {
     ctx.lineTo(centerX, rect.height);
     ctx.stroke();
     
-    if (driftScanMode) {
-      const scanX = rect.width * 0.3 + (Date.now() % 5000) / 5000 * rect.width * 0.4;
+    if (peakInfo && peakInfo.amplitude > minVal + (maxVal - minVal) * 0.1) {
+      const peakX = ((peakInfo.frequency - frequencyRange.min) / (frequencyRange.max - frequencyRange.min)) * rect.width;
       ctx.strokeStyle = 'rgba(255, 170, 0, 0.8)';
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([5, 5]);
+      ctx.beginPath();
+      ctx.moveTo(peakX, 0);
+      ctx.lineTo(peakX, rect.height);
+      ctx.stroke();
+      
+      ctx.fillStyle = 'rgba(255, 170, 0, 0.9)';
+      ctx.font = '10px JetBrains Mono';
+      ctx.fillText(`↑ ${peakInfo.frequency.toFixed(2)} MHz`, peakX + 3, 12);
+    }
+    
+    if (driftScanMode) {
+      const targetBin = Math.floor(((frequency - frequencyRange.min) / (frequencyRange.max - frequencyRange.min)) * binCount);
+      const scanX = (targetBin / binCount) * rect.width;
+      ctx.strokeStyle = 'rgba(0, 255, 255, 0.8)';
       ctx.lineWidth = 2;
       ctx.setLineDash([]);
       ctx.beginPath();
@@ -146,7 +188,52 @@ export function Waterfall({ className }: WaterfallProps) {
       ctx.stroke();
     }
     
-  }, [spectrumHistory, frequencyRange, driftScanMode]);
+    if (hoveredBin !== null && hoveredTime !== null) {
+      const hoverX = (hoveredBin / binCount) * rect.width;
+      const hoverY = (hoveredTime / SPECTRUM_HISTORY_LENGTH) * rect.height;
+      
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.8)';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([2, 2]);
+      ctx.beginPath();
+      ctx.moveTo(hoverX, 0);
+      ctx.lineTo(hoverX, rect.height);
+      ctx.moveTo(0, hoverY);
+      ctx.lineTo(rect.width, hoverY);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+    
+  }, [spectrumHistory, frequencyRange, driftScanMode, peakInfo, hoveredBin, hoveredTime]);
+  
+  const handleMouseMove = (e: React.MouseEvent<HTMLDivElement>) => {
+    const canvas = canvasRef.current;
+    const container = containerRef.current;
+    if (!canvas || !container) return;
+    
+    const rect = container.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+    
+    const binCount = spectrumHistory[0]?.length || SPECTRUM_BIN_COUNT;
+    const bin = Math.floor((x / rect.width) * binCount);
+    const timeIdx = Math.floor((y / rect.height) * SPECTRUM_HISTORY_LENGTH);
+    
+    setHoveredBin(bin);
+    setHoveredTime(timeIdx);
+  };
+  
+  const handleMouseLeave = () => {
+    setHoveredBin(null);
+    setHoveredTime(null);
+  };
+  
+  const getStatusColor = () => {
+    if (!pointingInfo.isObservable) return 'text-red-400';
+    if (trackingStatus === 'slewing') return 'text-yellow-400';
+    if (pointingInfo.inBeam) return 'text-green-400';
+    return 'text-yellow-400';
+  };
   
   return (
     <GlassPanel
@@ -157,12 +244,15 @@ export function Waterfall({ className }: WaterfallProps) {
       defaultCollapsed
     >
       <div className="flex justify-between items-center mb-2 text-xs font-mono">
-        <div className="flex gap-4">
+        <div className="flex gap-4 items-center">
           <span className="text-slate-400">
             带宽: <span className="text-cyan-300">10 MHz</span>
           </span>
           <span className="text-slate-400">
             分辨率: <span className="text-cyan-300">{(10 / SPECTRUM_BIN_COUNT).toFixed(2)} MHz/bin</span>
+          </span>
+          <span className="text-slate-400">
+            时间范围: <span className="text-cyan-300">{timeRange.total.toFixed(1)} s</span>
           </span>
         </div>
         <div className="flex items-center gap-2">
@@ -178,11 +268,79 @@ export function Waterfall({ className }: WaterfallProps) {
               漂移扫描
             </span>
           )}
+          {waterfallPaused && (
+            <span className="flex items-center gap-1 text-blue-400">
+              <span className="w-2 h-2 rounded-full bg-blue-500" />
+              已暂停
+            </span>
+          )}
+          <span className={`flex items-center gap-1 ${getStatusColor()}`}>
+            <Target size={12} />
+            {pointingInfo.inBeam ? '波束内' : pointingInfo.isObservable ? '捕获中' : '不可观测'}
+          </span>
         </div>
       </div>
       
-      <div ref={containerRef} className="w-full h-40 relative">
-        <canvas ref={canvasRef} className="absolute inset-0 rounded" />
+      <div className="flex gap-2 mb-2">
+        <GlowButton
+          onClick={toggleWaterfallPause}
+          size="xs"
+          variant={waterfallPaused ? 'success' : 'secondary'}
+          icon={waterfallPaused ? <Play size={12} /> : <Pause size={12} />}
+        >
+          {waterfallPaused ? '继续' : '暂停'}
+        </GlowButton>
+        <GlowButton
+          onClick={clearWaterfall}
+          size="xs"
+          variant="warning"
+          icon={<Trash2 size={12} />}
+        >
+          清空
+        </GlowButton>
+        <GlowButton
+          onClick={exportSpectrumData}
+          size="xs"
+          variant="primary"
+          icon={<Download size={12} />}
+        >
+          导出频谱
+        </GlowButton>
+      </div>
+      
+      {peakInfo && (
+        <div className="flex gap-4 mb-2 text-xs font-mono">
+          <span className="text-slate-400">
+            峰值频率: <span className="text-yellow-300">{peakInfo.frequency.toFixed(2)} MHz</span>
+          </span>
+          <span className="text-slate-400">
+            峰值幅度: <span className="text-yellow-300">{peakInfo.amplitude.toExponential(2)}</span>
+          </span>
+          <span className="text-slate-400">
+            指向误差: <span className={pointingInfo.pointingError < 0.1 ? 'text-green-300' : 'text-yellow-300'}>
+              {pointingInfo.pointingError.toFixed(3)}°
+            </span>
+          </span>
+        </div>
+      )}
+      
+      <div 
+        ref={containerRef} 
+        className="w-full h-48 relative"
+        onMouseMove={handleMouseMove}
+        onMouseLeave={handleMouseLeave}
+      >
+        <canvas 
+          ref={canvasRef} 
+          className="absolute inset-0 rounded cursor-crosshair" 
+        />
+        {hoveredBin !== null && hoveredTime !== null && spectrumHistory[hoveredTime] && (
+          <div className="absolute top-1 left-1 bg-slate-900/90 border border-cyan-500/50 rounded px-2 py-1 text-xs font-mono pointer-events-none">
+            <div>频率: {(frequencyRange.min + (hoveredBin / SPECTRUM_BIN_COUNT) * 10).toFixed(2)} MHz</div>
+            <div>时间: -{(timeRange.total - hoveredTime * timeRange.step).toFixed(2)} s</div>
+            <div>强度: {spectrumHistory[hoveredTime][hoveredBin]?.toExponential(3) || 'N/A'}</div>
+          </div>
+        )}
       </div>
       
       <div className="flex justify-between mt-1 text-xs font-mono text-slate-500">
@@ -192,8 +350,11 @@ export function Waterfall({ className }: WaterfallProps) {
       </div>
       
       <div className="flex justify-between items-center mt-2">
-        <div className="text-xs font-mono text-slate-500">
-          时间轴: 最新 ↑  历史 ↓
+        <div className="flex items-center gap-4 text-xs font-mono text-slate-500">
+          <span>时间轴: 最新 ↑  历史 ↓</span>
+          <span>
+            开始: {new Date(waterfallStartTime).toLocaleTimeString()}
+          </span>
         </div>
         <div className="flex items-center gap-2 text-xs font-mono">
           <span className="text-slate-500">低</span>
@@ -205,6 +366,12 @@ export function Waterfall({ className }: WaterfallProps) {
           <span className="text-slate-500">高</span>
         </div>
       </div>
+      
+      {!pointingInfo.isObservable && pointingInfo.reason && (
+        <div className="mt-2 p-2 bg-red-500/10 border border-red-500/30 rounded text-xs font-mono text-red-400">
+          ⚠️ {pointingInfo.reason}
+        </div>
+      )}
     </GlassPanel>
   );
 }

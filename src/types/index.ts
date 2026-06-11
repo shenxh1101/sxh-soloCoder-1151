@@ -1,6 +1,7 @@
 export type WeatherType = 'clear' | 'fog' | 'rain';
 export type SignalMode = 'sine' | 'pulse';
-export type TrackingStatus = 'idle' | 'moving' | 'tracking' | 'drifting';
+export type TrackingStatus = 'idle' | 'moving' | 'acquiring' | 'tracking' | 'drifting' | 'unobservable' | 'slewing';
+export type TaskStatus = 'pending' | 'running' | 'completed' | 'failed' | 'skipped';
 
 export interface StarData {
   id: string;
@@ -21,6 +22,7 @@ export interface TelescopeConfig {
   maxSpeed: number;
   observationLatitude: number;
   observationLongitude: number;
+  beamWidth: number;
 }
 
 export interface FeedPosition {
@@ -60,6 +62,37 @@ export interface RecordedData {
   snr: number;
   quality: number;
   weather: WeatherType;
+  pointingError: number;
+  targetInBeam: boolean;
+}
+
+export interface ObservationTask {
+  id: string;
+  name: string;
+  targetRA: number;
+  targetDec: number;
+  targetStarId?: string;
+  duration: number;
+  recordData: boolean;
+  status: TaskStatus;
+  progress: number;
+  startTime: number | null;
+  endTime: number | null;
+  result?: {
+    avgSNR: number;
+    avgSignalStrength: number;
+    peakFrequency: number;
+    dataPoints: number;
+  };
+  error?: string;
+}
+
+export interface PointingInfo {
+  isObservable: boolean;
+  reason?: string;
+  pointingError: number;
+  inBeam: boolean;
+  beamDistance: number;
 }
 
 export interface TelescopeState {
@@ -70,6 +103,7 @@ export interface TelescopeState {
   selectedStarId: string | null;
   feedPosition: FeedPosition;
   trackingStatus: TrackingStatus;
+  pointingInfo: PointingInfo;
   
   frequency: number;
   gain: number;
@@ -89,10 +123,19 @@ export interface TelescopeState {
   
   currentSignalStrength: number;
   currentSNR: number;
+  pointingError: number;
+  noiseFloor: number;
+  
+  waterfallPaused: boolean;
+  waterfallStartTime: number;
+  
+  observationTasks: ObservationTask[];
+  currentTaskIndex: number;
+  taskAutoRecord: boolean;
   
   setPointing: (az: number, alt: number) => void;
-  setTargetByRADec: (ra: number, dec: number) => void;
-  setTargetByStar: (star: StarData) => void;
+  setTargetByRADec: (ra: number, dec: number) => Promise<{ success: boolean; message?: string }>;
+  setTargetByStar: (star: StarData) => Promise<{ success: boolean; message?: string }>;
   setSignalParams: (freq: number, gain: number) => void;
   setSignalMode: (mode: SignalMode) => void;
   toggleRecording: () => void;
@@ -102,4 +145,17 @@ export interface TelescopeState {
   updateSignalData: () => void;
   exportCSV: () => void;
   resetView: () => void;
+  
+  toggleWaterfallPause: () => void;
+  clearWaterfall: () => void;
+  exportSpectrumData: () => void;
+  
+  addObservationTask: (task: Omit<ObservationTask, 'id' | 'status' | 'progress' | 'startTime' | 'endTime'>) => void;
+  removeObservationTask: (taskId: string) => void;
+  startObservationQueue: () => void;
+  stopObservationQueue: () => void;
+  clearObservationQueue: () => void;
+  moveTaskUp: (taskId: string) => void;
+  moveTaskDown: (taskId: string) => void;
+  _completeCurrentTask: () => void;
 }

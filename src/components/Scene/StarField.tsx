@@ -5,7 +5,8 @@ import { useTelescopeStore } from '@/store/useTelescopeStore';
 import { BRIGHT_STARS, PULSARS, generateFaintStars } from '@/data/stars';
 import { equatorialToHorizontal } from '@/utils/astronomy';
 import { SCALE_FACTOR } from '@/data/config';
-import type { StarData } from '@/types';
+import { WEATHER_VISIBILITY } from '@/utils/signal';
+import type { StarData, WeatherType } from '@/types';
 
 const STAR_DISTANCE = 500 * SCALE_FACTOR;
 const FAINT_STAR_COUNT = 4000;
@@ -22,6 +23,24 @@ function raDecToVector(ra: number, dec: number, distance: number, time: Date = n
   return new THREE.Vector3(x, y, z);
 }
 
+function getWeatherOpacity(weather: WeatherType, magnitude: number): number {
+  const visibility = WEATHER_VISIBILITY[weather];
+  
+  let baseOpacity = 1.0;
+  if (magnitude > 4) {
+    baseOpacity = Math.max(0, 1 - (magnitude - 4) * 0.15);
+  }
+  
+  let weatherFactor = visibility;
+  if (weather === 'fog') {
+    weatherFactor *= Math.max(0, 1 - (magnitude - 3) * 0.2);
+  } else if (weather === 'rain') {
+    weatherFactor *= Math.max(0, 1 - (magnitude - 2) * 0.25);
+  }
+  
+  return Math.max(0, baseOpacity * weatherFactor);
+}
+
 export function StarField() {
   const pointsRef = useRef<THREE.Points>(null);
   const brightStarsRef = useRef<THREE.Group>(null);
@@ -30,6 +49,8 @@ export function StarField() {
   
   const setTargetByStar = useTelescopeStore(state => state.setTargetByStar);
   const selectedStarId = useTelescopeStore(state => state.selectedStarId);
+  const weather = useTelescopeStore(state => state.weather);
+  const pointingInfo = useTelescopeStore(state => state.pointingInfo);
   
   const allStars = useMemo(() => {
     return [...BRIGHT_STARS, ...PULSARS];
@@ -37,11 +58,15 @@ export function StarField() {
   
   const faintStars = useMemo(() => generateFaintStars(FAINT_STAR_COUNT), []);
   
-  const { positions, colors, sizes } = useMemo(() => {
+  const { positions, colors, sizes, opacities } = useMemo(() => {
     const positions = new Float32Array(FAINT_STAR_COUNT * 3);
     const colors = new Float32Array(FAINT_STAR_COUNT * 3);
     const sizes = new Float32Array(FAINT_STAR_COUNT);
+    const opacities = new Float32Array(FAINT_STAR_COUNT);
     const now = new Date();
+    
+    const visibility = WEATHER_VISIBILITY[weather];
+    const magnitudeLimit = weather === 'clear' ? 8 : weather === 'fog' ? 5 : 4;
     
     for (let i = 0; i < FAINT_STAR_COUNT; i++) {
       const star = faintStars[i];
@@ -51,19 +76,34 @@ export function StarField() {
       positions[i * 3 + 1] = pos.y;
       positions[i * 3 + 2] = pos.z;
       
-      const brightness = Math.max(0.2, 1 - (star.magnitude - 6) / 10);
-      colors[i * 3] = 1;
-      colors[i * 3 + 1] = 1;
-      colors[i * 3 + 2] = 1;
-      sizes[i] = brightness * 0.3;
+      const starOpacity = getWeatherOpacity(weather, star.magnitude);
+      const isVisible = star.magnitude < magnitudeLimit && starOpacity > 0.05;
+      
+      if (isVisible) {
+        const brightness = Math.max(0.3, 1 - (star.magnitude - 6) / 10);
+        colors[i * 3] = 1;
+        colors[i * 3 + 1] = 1;
+        colors[i * 3 + 2] = 1;
+        sizes[i] = brightness * 0.3 * visibility;
+        opacities[i] = starOpacity;
+      } else {
+        colors[i * 3] = 0.2;
+        colors[i * 3 + 1] = 0.2;
+        colors[i * 3 + 2] = 0.25;
+        sizes[i] = 0.05;
+        opacities[i] = 0.02;
+      }
     }
     
-    return { positions, colors, sizes };
-  }, [faintStars]);
+    return { positions, colors, sizes, opacities };
+  }, [faintStars, weather]);
   
   useFrame((state) => {
     const time = state.clock.getElapsedTime();
     const now = new Date();
+    
+    const visibility = WEATHER_VISIBILITY[weather];
+    const magnitudeLimit = weather === 'clear' ? 8 : weather === 'fog' ? 5 : 4;
     
     if (brightStarsRef.current) {
       brightStarsRef.current.children.forEach((child, index) => {
@@ -74,26 +114,52 @@ export function StarField() {
         child.position.copy(pos);
         child.lookAt(0, 0, 0);
         
-        const mesh = child as THREE.Mesh;
-        if (mesh.material) {
+        const starOpacity = getWeatherOpacity(weather, star.magnitude);
+        const isVisible = star.magnitude < magnitudeLimit && starOpacity > 0.1;
+        
+        const mesh = child.children[0] as THREE.Mesh;
+        if (mesh && mesh.material) {
           const mat = mesh.material as THREE.MeshBasicMaterial;
-          const twinkle = 0.8 + 0.2 * Math.sin(time * 2 + index);
-          mat.opacity = twinkle;
+          const twinkle = isVisible ? (0.8 + 0.2 * Math.sin(time * 2 + index)) : 0.1;
+          mat.opacity = isVisible ? twinkle * starOpacity : 0.05;
+          
+          if (weather === 'fog') {
+            mat.color.setHSL(0.1, 0.2, 0.5 + twinkle * 0.2);
+          } else if (weather === 'rain') {
+            mat.color.setHSL(0.6, 0.3, 0.4 + twinkle * 0.2);
+          } else {
+            mat.color.set(star.color);
+          }
         }
         
         if (star.id === selectedStarId) {
-          child.scale.setScalar(2 + Math.sin(time * 4) * 0.3);
+          child.scale.setScalar(isVisible ? (2 + Math.sin(time * 4) * 0.3) : 0.5);
         } else if (hoveredStar === star.id) {
-          child.scale.setScalar(1.5);
+          child.scale.setScalar(isVisible ? 1.5 : 0.5);
         } else {
-          child.scale.setScalar(star.isPulsar ? 1.2 : 1);
+          child.scale.setScalar(isVisible ? (star.isPulsar ? 1.2 : 1) : 0.3);
+        }
+        
+        const labelSprite = child.children[1] as THREE.Sprite;
+        if (labelSprite && labelSprite.material) {
+          const labelMat = labelSprite.material as THREE.SpriteMaterial;
+          labelMat.opacity = isVisible ? 0.9 : 0.1;
         }
       });
     }
     
     if (pointsRef.current && pointsRef.current.material) {
       const mat = pointsRef.current.material as THREE.PointsMaterial;
-      mat.opacity = 0.7 + 0.1 * Math.sin(time * 0.5);
+      const baseOpacity = weather === 'clear' ? 0.7 : weather === 'fog' ? 0.3 : 0.15;
+      mat.opacity = baseOpacity + 0.1 * Math.sin(time * 0.5);
+      
+      if (weather === 'fog') {
+        mat.color.setHSL(0.1, 0.1, 0.6);
+      } else if (weather === 'rain') {
+        mat.color.setHSL(0.6, 0.2, 0.5);
+      } else {
+        mat.color.setHex(0xffffff);
+      }
     }
   });
   
@@ -189,6 +255,19 @@ export function StarField() {
           </group>
         ))}
       </group>
+      
+      {weather !== 'clear' && (
+        <mesh>
+          <sphereGeometry args={[STAR_DISTANCE * 0.99, 32, 32]} />
+          <meshBasicMaterial
+            color={weather === 'fog' ? '#4a4a3a' : '#2a3a4a'}
+            transparent
+            opacity={weather === 'fog' ? 0.3 : 0.2}
+            side={THREE.BackSide}
+            depthWrite={false}
+          />
+        </mesh>
+      )}
       
       {hoveredStar && (
         <sprite

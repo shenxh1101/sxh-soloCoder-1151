@@ -3,7 +3,7 @@ import { useTelescopeStore } from '@/store/useTelescopeStore';
 import { formatRA, formatDec, formatAzimuth, formatAltitude } from '@/utils/astronomy';
 import { GlassPanel } from '@/components/UI/GlassPanel';
 import { GlowButton } from '@/components/UI/GlowButton';
-import { Crosshair, Navigation, RotateCcw, Target } from 'lucide-react';
+import { Crosshair, Navigation, RotateCcw, Target, AlertTriangle, Radio, Satellite } from 'lucide-react';
 import { ALL_STARS } from '@/data/stars';
 
 export function PointingControl() {
@@ -12,6 +12,7 @@ export function PointingControl() {
   const [raInput, setRaInput] = useState('12.0');
   const [decInput, setDecInput] = useState('0.0');
   const [starFilter, setStarFilter] = useState('');
+  const [lastResult, setLastResult] = useState<{ success: boolean; message: string } | null>(null);
   
   const azimuth = useTelescopeStore(state => state.azimuth);
   const altitude = useTelescopeStore(state => state.altitude);
@@ -19,6 +20,7 @@ export function PointingControl() {
   const targetDec = useTelescopeStore(state => state.targetDec);
   const selectedStarId = useTelescopeStore(state => state.selectedStarId);
   const trackingStatus = useTelescopeStore(state => state.trackingStatus);
+  const pointingInfo = useTelescopeStore(state => state.pointingInfo);
   
   const setPointing = useTelescopeStore(state => state.setPointing);
   const setTargetByRADec = useTelescopeStore(state => state.setTargetByRADec);
@@ -34,29 +36,53 @@ export function PointingControl() {
     const alt = parseFloat(altInput);
     if (!isNaN(az) && !isNaN(alt)) {
       setPointing(az, alt);
+      setLastResult({ success: true, message: '指向命令已发送' });
+      setTimeout(() => setLastResult(null), 3000);
     }
   };
   
-  const handleSetRADec = () => {
+  const handleSetRADec = async () => {
     const ra = parseFloat(raInput);
     const dec = parseFloat(decInput);
     if (!isNaN(ra) && !isNaN(dec)) {
-      setTargetByRADec(ra, dec);
+      const result = await setTargetByRADec(ra, dec);
+      if (result.success) {
+        setLastResult({ success: true, message: '目标已捕获' });
+      } else {
+        setLastResult({ success: false, message: result.message || '指向失败' });
+      }
+      setTimeout(() => setLastResult(null), 4000);
     }
+  };
+  
+  const handleSetStar = async (star: any) => {
+    const result = await setTargetByStar(star);
+    if (result.success) {
+      setLastResult({ success: true, message: `已指向 ${star.name}` });
+    } else {
+      setLastResult({ success: false, message: result.message || '指向失败' });
+    }
+    setTimeout(() => setLastResult(null), 4000);
   };
   
   const trackingStatusText = {
     idle: '待机',
     moving: '移动中',
+    acquiring: '捕获中',
     tracking: '跟踪中',
     drifting: '漂移扫描',
+    unobservable: '不可观测',
+    slewing: '快速转向',
   };
   
   const trackingStatusColor = {
     idle: 'text-slate-400',
     moving: 'text-yellow-400',
+    acquiring: 'text-orange-400',
     tracking: 'text-green-400',
     drifting: 'text-cyan-400',
+    unobservable: 'text-red-400',
+    slewing: 'text-purple-400',
   };
   
   const selectedStar = ALL_STARS.find(s => s.id === selectedStarId);
@@ -87,7 +113,7 @@ export function PointingControl() {
           </div>
         </div>
         
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap">
           <span className="text-slate-500 text-xs font-mono">状态:</span>
           <span className={`text-sm font-mono ${trackingStatusColor[trackingStatus]}`}>
             {trackingStatusText[trackingStatus]}
@@ -98,7 +124,52 @@ export function PointingControl() {
           {trackingStatus === 'tracking' && (
             <span className="w-2 h-2 rounded-full bg-green-500 animate-pulse" />
           )}
+          {trackingStatus === 'acquiring' && (
+            <span className="w-2 h-2 rounded-full bg-orange-500 animate-pulse" />
+          )}
+          {trackingStatus === 'drifting' && (
+            <span className="w-2 h-2 rounded-full bg-cyan-500 animate-pulse" />
+          )}
         </div>
+        
+        {pointingInfo && (
+          <div className={`rounded p-2 text-xs font-mono space-y-1 ${
+            pointingInfo.isObservable 
+              ? pointingInfo.inBeam 
+                ? 'bg-green-500/10 border border-green-500/30' 
+                : 'bg-yellow-500/10 border border-yellow-500/30'
+              : 'bg-red-500/10 border border-red-500/30'
+          }`}>
+            {pointingInfo.isObservable ? (
+              pointingInfo.inBeam ? (
+                <div className="text-green-400 flex items-center gap-1">
+                  <Radio size={12} />
+                  目标在波束内 | 指向误差: {pointingInfo.pointingError.toFixed(3)}°
+                </div>
+              ) : (
+                <div className="text-yellow-400 flex items-center gap-1">
+                  <Satellite size={12} />
+                  捕获中... | 波束距离: {pointingInfo.beamDistance.toFixed(3)}°
+                </div>
+              )
+            ) : (
+              <div className="text-red-400 flex items-center gap-1">
+                <AlertTriangle size={12} />
+                {pointingInfo.reason || '目标不可观测'}
+              </div>
+            )}
+          </div>
+        )}
+        
+        {lastResult && (
+          <div className={`rounded p-2 text-xs font-mono ${
+            lastResult.success 
+              ? 'bg-green-500/10 border border-green-500/30 text-green-400' 
+              : 'bg-red-500/10 border border-red-500/30 text-red-400'
+          }`}>
+            {lastResult.message}
+          </div>
+        )}
         
         {selectedStar && (
           <div className="bg-green-500/10 border border-green-500/30 rounded p-2">
@@ -199,7 +270,7 @@ export function PointingControl() {
             {filteredStars.map((star) => (
               <button
                 key={star.id}
-                onClick={() => setTargetByStar(star)}
+                onClick={() => handleSetStar(star)}
                 className={`w-full text-left px-2 py-1 rounded text-xs font-mono transition-colors ${
                   selectedStarId === star.id
                     ? 'bg-green-500/20 text-green-400'

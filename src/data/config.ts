@@ -9,6 +9,7 @@ export const TELESCOPE_CONFIG: TelescopeConfig = {
   maxSpeed: 1.0,
   observationLatitude: 25.6528,
   observationLongitude: 106.8564,
+  beamWidth: 0.46,
 };
 
 export const SCALE_FACTOR = 0.05;
