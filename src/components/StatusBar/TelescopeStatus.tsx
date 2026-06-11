@@ -27,6 +27,7 @@ export function TelescopeStatus() {
     drifting: { color: 'text-cyan-400', bg: 'bg-cyan-500', label: '漂移扫描' },
     unobservable: { color: 'text-red-400', bg: 'bg-red-500', label: '不可观测' },
     slewing: { color: 'text-purple-400', bg: 'bg-purple-500', label: '快速转向' },
+    calibrating: { color: 'text-yellow-400', bg: 'bg-yellow-500', label: '校准中' },
   };
   
   const weatherLabel = {

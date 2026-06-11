@@ -4,12 +4,44 @@ import { GlassPanel } from '@/components/UI/GlassPanel';
 import { GlowButton } from '@/components/UI/GlowButton';
 import { ALL_STARS } from '@/data/stars';
 import { formatRA, formatDec } from '@/utils/astronomy';
-import { ListTodo, Play, Square, Plus, Trash2, ChevronUp, ChevronDown, CheckCircle, XCircle, Clock, Loader } from 'lucide-react';
-import type { StarData, ObservationTask } from '@/types';
+import { 
+  ListTodo, Play, Square, Plus, Trash2, ChevronUp, ChevronDown, 
+  CheckCircle, XCircle, Clock, Loader, Target, Radio, 
+  FastForward, Rewind, Pause, PlayCircle, StopCircle 
+} from 'lucide-react';
+import type { StarData, ObservationTask, TaskPhase } from '@/types';
+
+const PHASE_LABELS: Record<TaskPhase, string> = {
+  idle: '待机',
+  preparing: '准备中',
+  calibrating: '校准中',
+  observing: '观测中',
+  wrapping: '收尾中',
+};
+
+const PHASE_COLORS: Record<TaskPhase, string> = {
+  idle: 'bg-slate-500',
+  preparing: 'bg-blue-500',
+  calibrating: 'bg-yellow-500',
+  observing: 'bg-green-500',
+  wrapping: 'bg-purple-500',
+};
+
+const PHASE_TEXT_COLORS: Record<TaskPhase, string> = {
+  idle: 'text-slate-400',
+  preparing: 'text-blue-400',
+  calibrating: 'text-yellow-400',
+  observing: 'text-green-400',
+  wrapping: 'text-purple-400',
+};
 
 export function ObservationQueue() {
   const observationTasks = useTelescopeStore(state => state.observationTasks);
   const currentTaskIndex = useTelescopeStore(state => state.currentTaskIndex);
+  const isReplayMode = useTelescopeStore(state => state.isReplayMode);
+  const replayTaskId = useTelescopeStore(state => state.replayTaskId);
+  const replayTime = useTelescopeStore(state => state.replayTime);
+  const replayPaused = useTelescopeStore(state => state.replayPaused);
   
   const addObservationTask = useTelescopeStore(state => state.addObservationTask);
   const removeObservationTask = useTelescopeStore(state => state.removeObservationTask);
@@ -20,6 +52,10 @@ export function ObservationQueue() {
   const moveTaskDown = useTelescopeStore(state => state.moveTaskDown);
   const setTargetByStar = useTelescopeStore(state => state.setTargetByStar);
   const setTargetByRADec = useTelescopeStore(state => state.setTargetByRADec);
+  const startReplay = useTelescopeStore(state => state.startReplay);
+  const stopReplay = useTelescopeStore(state => state.stopReplay);
+  const toggleReplayPause = useTelescopeStore(state => state.toggleReplayPause);
+  const setReplayTime = useTelescopeStore(state => state.setReplayTime);
   
   const [showAddForm, setShowAddForm] = useState(false);
   const [taskName, setTaskName] = useState('');
@@ -29,6 +65,7 @@ export function ObservationQueue() {
   const [manualDec, setManualDec] = useState('0.0');
   const [taskDuration, setTaskDuration] = useState('30');
   const [autoRecord, setAutoRecord] = useState(true);
+  const [expandedTaskId, setExpandedTaskId] = useState<string | null>(null);
   
   const isRunning = useMemo(() => 
     observationTasks.some(t => t.status === 'running'), 
@@ -112,6 +149,107 @@ export function ObservationQueue() {
     }
   };
   
+  const renderPhaseTimeline = (task: ObservationTask) => {
+    const phases: TaskPhase[] = ['preparing', 'calibrating', 'observing', 'wrapping'];
+    const totalDuration = phases.reduce((sum, p) => sum + task.phaseTiming[p], 0);
+    
+    return (
+      <div className="mt-2 mb-2">
+        <div className="flex justify-between text-[10px] font-mono text-slate-500 mb-1">
+          <span>任务阶段</span>
+          <span>总时长: {totalDuration}s</span>
+        </div>
+        <div className="flex h-2 rounded-full overflow-hidden bg-slate-700/50">
+          {phases.map((phase) => {
+            const phaseDuration = task.phaseTiming[phase];
+            const width = (phaseDuration / totalDuration) * 100;
+            const isActive = task.status === 'running' && task.currentPhase === phase;
+            const isPast = 
+              (task.status === 'completed') ||
+              (task.status === 'running' && 
+               phases.indexOf(task.currentPhase) > phases.indexOf(phase));
+            
+            return (
+              <div
+                key={phase}
+                className={`h-full transition-all ${
+                  isActive ? `${PHASE_COLORS[phase]} animate-pulse` :
+                  isPast ? PHASE_COLORS[phase] :
+                  'bg-slate-600/30'
+                }`}
+                style={{ width: `${width}%` }}
+                title={`${PHASE_LABELS[phase]}: ${phaseDuration}s`}
+              />
+            );
+          })}
+        </div>
+        <div className="flex justify-between text-[9px] font-mono mt-1">
+          {phases.map((phase) => (
+            <span key={phase} className={task.currentPhase === phase ? PHASE_TEXT_COLORS[phase] : 'text-slate-500'}>
+              {PHASE_LABELS[phase]}
+            </span>
+          ))}
+        </div>
+      </div>
+    );
+  };
+  
+  const renderTimeSeriesChart = (task: ObservationTask) => {
+    if (!task.timeSeriesData || task.timeSeriesData.timestamps.length === 0) {
+      return null;
+    }
+    
+    const { snr, timestamps } = task.timeSeriesData;
+    const maxSNR = Math.max(...snr, 1);
+    const minSNR = Math.min(...snr, 0);
+    const range = maxSNR - minSNR || 1;
+    
+    const replayIdx = isReplayMode && replayTaskId === task.id 
+      ? Math.floor(replayTime) 
+      : -1;
+    
+    return (
+      <div className="mt-3 pt-2 border-t border-slate-700/30">
+        <div className="text-xs font-mono text-slate-400 mb-2">SNR 时间曲线</div>
+        <div className="relative h-16 bg-slate-800/50 rounded overflow-hidden">
+          <svg className="absolute inset-0 w-full h-full" viewBox={`0 0 ${snr.length} 100`} preserveAspectRatio="none">
+            <polyline
+              fill="none"
+              stroke="rgba(0, 212, 255, 0.6)"
+              strokeWidth="0.5"
+              points={snr.map((val, i) => `${i},${100 - ((val - minSNR) / range) * 100}`).join(' ')}
+            />
+            {replayIdx >= 0 && replayIdx < snr.length && (
+              <line
+                x1={replayIdx}
+                y1="0"
+                x2={replayIdx}
+                y2="100"
+                stroke="#00ff88"
+                strokeWidth="1"
+              />
+            )}
+          </svg>
+          <div className="absolute top-1 left-2 text-[10px] font-mono text-slate-500">
+            {maxSNR.toFixed(1)} dB
+          </div>
+          <div className="absolute bottom-1 left-2 text-[10px] font-mono text-slate-500">
+            {minSNR.toFixed(1)} dB
+          </div>
+          <div className="absolute bottom-1 right-2 text-[10px] font-mono text-slate-500">
+            {timestamps.length}s
+          </div>
+        </div>
+      </div>
+    );
+  };
+  
+  const handleReplaySliderChange = (taskId: string, value: number) => {
+    if (replayTaskId === taskId) {
+      setReplayTime(value);
+    }
+  };
+  
   const completedCount = observationTasks.filter(t => t.status === 'completed').length;
   const totalDuration = observationTasks.reduce((sum, t) => sum + t.duration, 0);
   
@@ -120,10 +258,9 @@ export function ObservationQueue() {
       title="观测任务队列"
       icon={<ListTodo size={16} />}
       collapsible
-      defaultCollapsed
     >
       <div className="space-y-3">
-        <div className="flex justify-between items-center">
+        <div className="flex justify-between items-center flex-wrap gap-2">
           <div className="text-xs font-mono text-slate-400">
             <span>共 {observationTasks.length} 个任务</span>
             <span className="mx-2">|</span>
@@ -131,14 +268,14 @@ export function ObservationQueue() {
             <span className="mx-2">|</span>
             <span>预计总时长 {totalDuration}s</span>
           </div>
-          <div className="flex gap-2">
+          <div className="flex gap-2 flex-wrap">
             {!isRunning ? (
               <GlowButton
                 onClick={startObservationQueue}
                 size="xs"
                 variant="success"
                 icon={<Play size={12} />}
-                disabled={observationTasks.length === 0 || observationTasks.every(t => t.status === 'completed')}
+                disabled={observationTasks.length === 0 || observationTasks.every(t => t.status === 'completed') || isReplayMode}
               >
                 开始执行
               </GlowButton>
@@ -166,12 +303,29 @@ export function ObservationQueue() {
               size="xs"
               variant="warning"
               icon={<Trash2 size={12} />}
-              disabled={observationTasks.length === 0}
+              disabled={observationTasks.length === 0 || isRunning || isReplayMode}
             >
               清空
             </GlowButton>
           </div>
         </div>
+        
+        {isReplayMode && (
+          <div className="bg-purple-500/10 border border-purple-500/30 rounded p-2">
+            <div className="text-xs text-purple-300 font-mono flex items-center gap-2">
+              <PlayCircle size={14} />
+              <span>回放模式</span>
+              {replayPaused ? <Pause size={12} /> : <Play size={12} />}
+              <button
+                onClick={stopReplay}
+                className="ml-auto text-purple-400 hover:text-purple-300"
+                title="退出回放"
+              >
+                <StopCircle size={14} />
+              </button>
+            </div>
+          </div>
+        )}
         
         {showAddForm && (
           <div className="bg-slate-800/50 rounded p-3 space-y-3">
@@ -295,132 +449,208 @@ export function ObservationQueue() {
           </div>
         )}
         
-        <div className="space-y-2 max-h-64 overflow-y-auto pr-2">
+        <div className="space-y-2 max-h-96 overflow-y-auto pr-2">
           {observationTasks.length === 0 ? (
             <div className="text-center py-8 text-slate-500 font-mono text-sm">
               暂无观测任务，点击"添加任务"开始
             </div>
           ) : (
-            observationTasks.map((task, index) => (
-              <div
-                key={task.id}
-                className={`p-3 rounded border transition-all ${
-                  currentTaskIndex === index && task.status === 'running'
-                    ? 'bg-cyan-500/10 border-cyan-500/50'
-                    : task.status === 'completed'
-                    ? 'bg-green-500/5 border-green-500/20'
-                    : task.status === 'failed'
-                    ? 'bg-red-500/5 border-red-500/20'
-                    : 'bg-slate-800/30 border-slate-700/30 hover:border-slate-600/50'
-                }`}
-              >
-                <div className="flex items-start justify-between">
-                  <div className="flex-1">
-                    <div className="flex items-center gap-2 mb-1">
-                      {getStatusIcon(task.status)}
-                      <span className="text-sm font-mono text-slate-200 font-medium">
-                        {index + 1}. {task.name}
-                      </span>
-                      <span className={`text-xs font-mono px-1.5 py-0.5 rounded ${
-                        task.status === 'running' ? 'bg-cyan-500/20 text-cyan-300' :
-                        task.status === 'completed' ? 'bg-green-500/20 text-green-300' :
-                        task.status === 'failed' ? 'bg-red-500/20 text-red-300' :
-                        'bg-slate-700/50 text-slate-400'
-                      }`}>
-                        {getStatusText(task.status)}
-                      </span>
-                    </div>
-                    
-                    <div className="text-xs font-mono text-slate-400 space-y-0.5">
-                      <div>
-                        RA: {formatRA(task.targetRA)} | Dec: {formatDec(task.targetDec)}
-                      </div>
-                      <div className="flex gap-4">
-                        <span>时长: {task.duration}s</span>
-                        <span>记录: {task.recordData ? '是' : '否'}</span>
+            observationTasks.map((task, index) => {
+              const isExpanded = expandedTaskId === task.id;
+              const isReplayingThis = isReplayMode && replayTaskId === task.id;
+              
+              return (
+                <div
+                  key={task.id}
+                  className={`p-3 rounded border transition-all ${
+                    currentTaskIndex === index && task.status === 'running'
+                      ? 'bg-cyan-500/10 border-cyan-500/50'
+                      : isReplayingThis
+                      ? 'bg-purple-500/10 border-purple-500/50'
+                      : task.status === 'completed'
+                      ? 'bg-green-500/5 border-green-500/20'
+                      : task.status === 'failed'
+                      ? 'bg-red-500/5 border-red-500/20'
+                      : 'bg-slate-800/30 border-slate-700/30 hover:border-slate-600/50'
+                  }`}
+                >
+                  <div className="flex items-start justify-between">
+                    <div className="flex-1">
+                      <div className="flex items-center gap-2 mb-1">
+                        {getStatusIcon(task.status)}
+                        <span className="text-sm font-mono text-slate-200 font-medium">
+                          {index + 1}. {task.name}
+                        </span>
+                        <span className={`text-xs font-mono px-1.5 py-0.5 rounded ${
+                          task.status === 'running' ? 'bg-cyan-500/20 text-cyan-300' :
+                          task.status === 'completed' ? 'bg-green-500/20 text-green-300' :
+                          task.status === 'failed' ? 'bg-red-500/20 text-red-300' :
+                          'bg-slate-700/50 text-slate-400'
+                        }`}>
+                          {getStatusText(task.status)}
+                        </span>
+                        {task.status === 'running' && (
+                          <span className={`text-xs font-mono px-1.5 py-0.5 rounded ${PHASE_COLORS[task.currentPhase]}/20 ${PHASE_TEXT_COLORS[task.currentPhase]}`}>
+                            {PHASE_LABELS[task.currentPhase]}
+                          </span>
+                        )}
                       </div>
                       
-                      {task.result && (
-                        <div className="mt-1 pt-1 border-t border-slate-700/30 text-green-400">
-                          <span className="mr-3">平均SNR: {task.result.avgSNR.toFixed(1)} dB</span>
-                          <span className="mr-3">平均强度: {task.result.avgSignalStrength.toFixed(3)}</span>
-                          <span className="mr-3">峰值频率: {task.result.peakFrequency.toFixed(1)} MHz</span>
-                          <span>数据点: {task.result.dataPoints}</span>
+                      <div className="text-xs font-mono text-slate-400 space-y-0.5">
+                        <div>
+                          RA: {formatRA(task.targetRA)} | Dec: {formatDec(task.targetDec)}
                         </div>
-                      )}
-                      
-                      {task.error && (
-                        <div className="mt-1 pt-1 border-t border-slate-700/30 text-red-400">
-                          错误: {task.error}
+                        <div className="flex gap-4">
+                          <span>观测: {task.duration}s</span>
+                          <span>记录: {task.recordData ? '是' : '否'}</span>
                         </div>
-                      )}
+                        
+                        {task.status === 'running' && renderPhaseTimeline(task)}
+                        
+                        {task.status === 'running' && (
+                          <div className="mt-1">
+                            <div className="flex justify-between text-xs font-mono text-slate-400 mb-1">
+                              <span>总进度</span>
+                              <span>{task.progress.toFixed(1)}%</span>
+                            </div>
+                            <div className="h-1.5 bg-slate-700 rounded-full overflow-hidden">
+                              <div
+                                className="h-full bg-gradient-to-r from-cyan-500 to-green-500 transition-all duration-100"
+                                style={{ width: `${task.progress}%` }}
+                              />
+                            </div>
+                          </div>
+                        )}
+                        
+                        {task.result && (
+                          <div className="mt-1 pt-1 border-t border-slate-700/30 text-green-400 space-y-1">
+                            <div className="flex gap-3 flex-wrap">
+                              <span>平均SNR: {task.result.avgSNR.toFixed(1)} dB</span>
+                              <span>最大SNR: {task.result.maxSNR?.toFixed(1) || '-'} dB</span>
+                            </div>
+                            <div className="flex gap-3 flex-wrap">
+                              <span>平均强度: {task.result.avgSignalStrength.toFixed(3)}</span>
+                              <span>峰值频率: {task.result.peakFrequency.toFixed(1)} MHz</span>
+                            </div>
+                          </div>
+                        )}
+                        
+                        {task.error && (
+                          <div className="mt-1 pt-1 border-t border-slate-700/30 text-red-400">
+                            错误: {task.error}
+                          </div>
+                        )}
+                        
+                        {isExpanded && task.status === 'completed' && renderTimeSeriesChart(task)}
+                        
+                        {isReplayingThis && task.timeSeriesData && (
+                          <div className="mt-3 pt-2 border-t border-purple-500/30">
+                            <div className="flex items-center gap-2 mb-2">
+                              <button
+                                onClick={toggleReplayPause}
+                                className="p-1 hover:bg-purple-500/20 rounded text-purple-400"
+                              >
+                                {replayPaused ? <Play size={14} /> : <Pause size={14} />}
+                              </button>
+                              <input
+                                type="range"
+                                min="0"
+                                max={task.timeSeriesData.timestamps.length - 1}
+                                value={Math.floor(replayTime)}
+                                onChange={(e) => handleReplaySliderChange(task.id, parseFloat(e.target.value))}
+                                className="flex-1 accent-purple-500"
+                              />
+                              <span className="text-xs font-mono text-purple-300 w-12 text-right">
+                                {Math.floor(replayTime)}s
+                              </span>
+                            </div>
+                          </div>
+                        )}
+                      </div>
                     </div>
                     
-                    {task.status === 'running' && (
-                      <div className="mt-2">
-                        <div className="flex justify-between text-xs font-mono text-slate-400 mb-1">
-                          <span>进度</span>
-                          <span>{task.progress.toFixed(0)}%</span>
-                        </div>
-                        <div className="h-1.5 bg-slate-700 rounded-full overflow-hidden">
-                          <div
-                            className="h-full bg-gradient-to-r from-cyan-500 to-green-500 transition-all duration-300"
-                            style={{ width: `${task.progress}%` }}
-                          />
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                  
-                  <div className="flex flex-col gap-1 ml-2">
-                    {task.status === 'pending' && (
-                      <>
+                    <div className="flex flex-col gap-1 ml-2">
+                      {task.status === 'pending' && !isRunning && !isReplayMode && (
+                        <>
+                          <button
+                            onClick={() => moveTaskUp(task.id)}
+                            disabled={index === 0}
+                            className="p-1 hover:bg-slate-700/50 rounded disabled:opacity-30 disabled:cursor-not-allowed"
+                            title="上移"
+                          >
+                            <ChevronUp size={14} className="text-slate-400" />
+                          </button>
+                          <button
+                            onClick={() => moveTaskDown(task.id)}
+                            disabled={index === observationTasks.length - 1}
+                            className="p-1 hover:bg-slate-700/50 rounded disabled:opacity-30 disabled:cursor-not-allowed"
+                            title="下移"
+                          >
+                            <ChevronDown size={14} className="text-slate-400" />
+                          </button>
+                        </>
+                      )}
+                      
+                      {task.status !== 'running' && !isReplayMode && (
                         <button
-                          onClick={() => moveTaskUp(task.id)}
-                          disabled={index === 0}
-                          className="p-1 hover:bg-slate-700/50 rounded disabled:opacity-30 disabled:cursor-not-allowed"
+                          onClick={() => handleGotoTask(task)}
+                          className="p-1 hover:bg-cyan-500/20 rounded"
+                          title="指向此目标"
                         >
-                          <ChevronUp size={14} className="text-slate-400" />
+                          <Target size={14} className="text-cyan-400" />
                         </button>
+                      )}
+                      
+                      {task.status === 'completed' && task.timeSeriesData && task.timeSeriesData.timestamps.length > 0 && (
                         <button
-                          onClick={() => moveTaskDown(task.id)}
-                          disabled={index === observationTasks.length - 1}
-                          className="p-1 hover:bg-slate-700/50 rounded disabled:opacity-30 disabled:cursor-not-allowed"
+                          onClick={() => {
+                            if (replayTaskId === task.id && isReplayMode) {
+                              stopReplay();
+                            } else {
+                              startReplay(task.id);
+                            }
+                          }}
+                          className={`p-1 rounded ${
+                            isReplayingThis ? 'bg-purple-500/30 text-purple-300' : 'hover:bg-purple-500/20 text-purple-400'
+                          }`}
+                          title={isReplayingThis ? '停止回放' : '回放观测数据'}
                         >
-                          <ChevronDown size={14} className="text-slate-400" />
+                          {isReplayingThis ? <Square size={14} /> : <Radio size={14} />}
                         </button>
-                      </>
-                    )}
-                    
-                    {task.status !== 'running' && (
-                      <button
-                        onClick={() => handleGotoTask(task)}
-                        className="p-1 hover:bg-cyan-500/20 rounded"
-                        title="指向此目标"
-                      >
-                        <Play size={14} className="text-cyan-400" />
-                      </button>
-                    )}
-                    
-                    {task.status === 'pending' && (
-                      <button
-                        onClick={() => removeObservationTask(task.id)}
-                        className="p-1 hover:bg-red-500/20 rounded"
-                        title="删除任务"
-                      >
-                        <Trash2 size={14} className="text-red-400" />
-                      </button>
-                    )}
+                      )}
+                      
+                      {task.status === 'pending' && !isRunning && !isReplayMode && (
+                        <button
+                          onClick={() => removeObservationTask(task.id)}
+                          className="p-1 hover:bg-red-500/20 rounded"
+                          title="删除任务"
+                        >
+                          <Trash2 size={14} className="text-red-400" />
+                        </button>
+                      )}
+                      
+                      {task.status === 'completed' && (
+                        <button
+                          onClick={() => setExpandedTaskId(isExpanded ? null : task.id)}
+                          className={`p-1 rounded ${
+                            isExpanded ? 'bg-slate-600/50 text-cyan-300' : 'hover:bg-slate-700/50 text-slate-400'
+                          }`}
+                          title="展开/收起详情"
+                        >
+                          {isExpanded ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+                        </button>
+                      )}
+                    </div>
                   </div>
                 </div>
-              </div>
-            ))
+              );
+            })
           )}
         </div>
         
         <div className="bg-yellow-500/10 border border-yellow-500/30 rounded p-2">
           <div className="text-xs text-yellow-400 font-mono">
-            💡 提示: 任务队列会按顺序自动执行观测，包括指向目标、跟踪和数据记录。执行完成后可查看每个任务的观测结果统计。
+            💡 每个任务包含准备→校准→观测→收尾四个阶段，校准阶段会确保目标稳定在波束内再开始记录。完成后可点击回放按钮查看 SNR 时间曲线。
           </div>
         </div>
       </div>

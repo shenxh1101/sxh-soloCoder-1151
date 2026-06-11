@@ -62,10 +62,18 @@ function CameraController() {
 
 function SceneUpdater() {
   const updateSignalData = useTelescopeStore(state => state.updateSignalData);
+  const updateReplay = useTelescopeStore(state => state.updateReplay);
+  const isReplayMode = useTelescopeStore(state => state.isReplayMode);
   
   useAnimationFrame(() => {
     updateSignalData();
   }, true);
+  
+  useFrame((_, delta) => {
+    if (isReplayMode) {
+      updateReplay(delta);
+    }
+  });
   
   return null;
 }

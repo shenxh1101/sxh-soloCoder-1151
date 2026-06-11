@@ -1,7 +1,15 @@
 export type WeatherType = 'clear' | 'fog' | 'rain';
 export type SignalMode = 'sine' | 'pulse';
-export type TrackingStatus = 'idle' | 'moving' | 'acquiring' | 'tracking' | 'drifting' | 'unobservable' | 'slewing';
+export type TrackingStatus = 'idle' | 'moving' | 'acquiring' | 'tracking' | 'drifting' | 'unobservable' | 'slewing' | 'calibrating';
 export type TaskStatus = 'pending' | 'running' | 'completed' | 'failed' | 'skipped';
+export type TaskPhase = 'preparing' | 'calibrating' | 'observing' | 'wrapping' | 'idle';
+
+export interface TaskPhaseTiming {
+  preparing: number;
+  calibrating: number;
+  observing: number;
+  wrapping: number;
+}
 
 export interface StarData {
   id: string;
@@ -76,13 +84,31 @@ export interface ObservationTask {
   recordData: boolean;
   status: TaskStatus;
   progress: number;
+  currentPhase: TaskPhase;
+  phaseProgress: number;
   startTime: number | null;
   endTime: number | null;
+  phaseTiming: TaskPhaseTiming;
+  phaseStartTimes: {
+    preparing: number | null;
+    calibrating: number | null;
+    observing: number | null;
+    wrapping: number | null;
+  };
+  timeSeriesData?: {
+    timestamps: number[];
+    snr: number[];
+    signalStrength: number[];
+    pointingError: number[];
+    quality: number[];
+  };
   result?: {
     avgSNR: number;
     avgSignalStrength: number;
     peakFrequency: number;
     dataPoints: number;
+    maxSNR: number;
+    minSNR: number;
   };
   error?: string;
 }
@@ -133,6 +159,11 @@ export interface TelescopeState {
   currentTaskIndex: number;
   taskAutoRecord: boolean;
   
+  isReplayMode: boolean;
+  replayTaskId: string | null;
+  replayTime: number;
+  replayPaused: boolean;
+  
   setPointing: (az: number, alt: number) => void;
   setTargetByRADec: (ra: number, dec: number) => Promise<{ success: boolean; message?: string }>;
   setTargetByStar: (star: StarData) => Promise<{ success: boolean; message?: string }>;
@@ -150,7 +181,7 @@ export interface TelescopeState {
   clearWaterfall: () => void;
   exportSpectrumData: () => void;
   
-  addObservationTask: (task: Omit<ObservationTask, 'id' | 'status' | 'progress' | 'startTime' | 'endTime'>) => void;
+  addObservationTask: (task: Omit<ObservationTask, 'id' | 'status' | 'progress' | 'startTime' | 'endTime' | 'currentPhase' | 'phaseProgress' | 'phaseTiming' | 'phaseStartTimes'>) => void;
   removeObservationTask: (taskId: string) => void;
   startObservationQueue: () => void;
   stopObservationQueue: () => void;
@@ -158,4 +189,10 @@ export interface TelescopeState {
   moveTaskUp: (taskId: string) => void;
   moveTaskDown: (taskId: string) => void;
   _completeCurrentTask: () => void;
+  
+  startReplay: (taskId: string) => void;
+  stopReplay: () => void;
+  setReplayTime: (time: number) => void;
+  toggleReplayPause: () => void;
+  updateReplay: (deltaTime: number) => void;
 }

@@ -116,6 +116,11 @@ export const useTelescopeStore = create<TelescopeState>((set, get) => ({
   currentTaskIndex: -1,
   taskAutoRecord: true,
   
+  isReplayMode: false,
+  replayTaskId: null,
+  replayTime: 0,
+  replayPaused: false,
+  
   setPointing: (az: number, alt: number) => {
     const targetAz = normalizeAzimuth(az);
     const targetAlt = clampAltitude(alt);
@@ -560,24 +565,6 @@ export const useTelescopeStore = create<TelescopeState>((set, get) => ({
       peakFrequency = peak.frequency;
     }
     
-    if (taskQueueRunning && state.currentTaskIndex >= 0) {
-      const currentTask = state.observationTasks[state.currentTaskIndex];
-      if (currentTask && currentTask.status === 'running' && currentTask.startTime) {
-        const elapsed = (now - currentTask.startTime) / 1000;
-        const progress = Math.min(100, (elapsed / currentTask.duration) * 100);
-        
-        if (progress >= 100) {
-          get()._completeCurrentTask();
-        } else {
-          set({
-            observationTasks: state.observationTasks.map((t, i) =>
-              i === state.currentTaskIndex ? { ...t, progress } : t
-            ),
-          });
-        }
-      }
-    }
-    
     set({
       waveformData: waveform,
       spectrumHistory: newHistory,
@@ -641,13 +628,36 @@ export const useTelescopeStore = create<TelescopeState>((set, get) => ({
   },
   
   addObservationTask: (task) => {
+    const phaseTiming = {
+      preparing: 2,
+      calibrating: 3,
+      observing: task.duration,
+      wrapping: 1,
+    };
+    
     const newTask: ObservationTask = {
       ...task,
       id: `task-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
       status: 'pending',
       progress: 0,
+      currentPhase: 'idle',
+      phaseProgress: 0,
       startTime: null,
       endTime: null,
+      phaseTiming,
+      phaseStartTimes: {
+        preparing: null,
+        calibrating: null,
+        observing: null,
+        wrapping: null,
+      },
+      timeSeriesData: {
+        timestamps: [],
+        snr: [],
+        signalStrength: [],
+        pointingError: [],
+        quality: [],
+      },
     };
     
     set(state => ({
@@ -678,53 +688,338 @@ export const useTelescopeStore = create<TelescopeState>((set, get) => ({
       
       set(state => ({
         observationTasks: state.observationTasks.map((t, idx) =>
-          idx === i ? { ...t, status: 'running' as const, progress: 0 } : t
+          idx === i ? { 
+            ...t, 
+            status: 'running' as const, 
+            progress: 0,
+            currentPhase: 'preparing' as const,
+            phaseProgress: 0,
+            startTime: Date.now(),
+            phaseStartTimes: {
+              ...t.phaseStartTimes,
+              preparing: Date.now(),
+            },
+          } : t
         ),
       }));
       
-      const result = task.targetStarId
+      const { observing: observeDuration, calibrating: calibrateDuration, preparing: prepareDuration, wrapping: wrapDuration } = task.phaseTiming;
+      
+      // ========== 准备阶段：转向目标 ==========
+      const slewResult = task.targetStarId
         ? await get().setTargetByStar(ALL_STARS.find(s => s.id === task.targetStarId)!)
         : await get().setTargetByRADec(task.targetRA, task.targetDec);
       
-      if (!result.success) {
+      if (!slewResult.success) {
         set(state => ({
           observationTasks: state.observationTasks.map((t, idx) =>
             idx === i ? {
               ...t,
               status: 'failed' as const,
               endTime: Date.now(),
-              error: result.message || '目标不可观测',
+              currentPhase: 'idle' as const,
+              error: slewResult.message || '目标不可观测',
             } : t
           ),
         }));
         continue;
       }
       
+      // 等待准备阶段时间完成（至少等转向完成）
+      const prepareStart = Date.now();
+      while (Date.now() - prepareStart < prepareDuration * 1000) {
+        if (!taskQueueRunning) break;
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+      if (!taskQueueRunning) break;
+      
+      // ========== 校准阶段：确保目标稳定在波束内 ==========
+      set(state => ({
+        observationTasks: state.observationTasks.map((t, idx) =>
+          idx === i ? {
+            ...t,
+            currentPhase: 'calibrating' as const,
+            phaseProgress: 0,
+            phaseStartTimes: {
+              ...t.phaseStartTimes,
+              calibrating: Date.now(),
+            },
+          } : t
+        ),
+      }));
+      
+      set({ trackingStatus: 'calibrating' });
+      
+      // 校准阶段：持续跟踪，确保目标在波束内稳定
+      const calibrateStart = Date.now();
+      let stableTime = 0;
+      let lastInBeam = false;
+      
+      while (Date.now() - calibrateStart < calibrateDuration * 1000) {
+        if (!taskQueueRunning) break;
+        
+        const currentState = get();
+        const currentTask = currentState.observationTasks[i];
+        if (!currentTask) break;
+        
+        // 实时更新目标位置（因为地球自转）
+        const { azimuth: targetAz, altitude: targetAlt } = equatorialToHorizontal(currentTask.targetRA, currentTask.targetDec);
+        const isObservable = targetAlt >= TELESCOPE_CONFIG.minAltitude && targetAlt <= TELESCOPE_CONFIG.maxAltitude;
+        
+        if (!isObservable) {
+          set(state => ({
+            observationTasks: state.observationTasks.map((t, idx) =>
+              idx === i ? {
+                ...t,
+                status: 'failed' as const,
+                endTime: Date.now(),
+                currentPhase: 'idle' as const,
+                error: '目标在天空中移动出了可观测范围',
+              } : t
+            ),
+          }));
+          break;
+        }
+        
+        // 持续修正指向
+        const distance = angularDistanceDeg(currentState.azimuth, currentState.altitude, targetAz, targetAlt);
+        if (distance > TELESCOPE_CONFIG.beamWidth * 0.5) {
+          motionState = {
+            startAz: currentState.azimuth,
+            startAlt: currentState.altitude,
+            targetAz: normalizeAzimuth(targetAz),
+            targetAlt: clampAltitude(targetAlt),
+            progress: 0,
+            duration: Math.max(0.3, distance / TELESCOPE_CONFIG.maxSpeed),
+          };
+          set({ trackingStatus: 'calibrating' });
+        }
+        
+        // 检查是否稳定在波束内
+        const inBeam = currentState.pointingInfo.inBeam && currentState.pointingInfo.isObservable;
+        if (inBeam && lastInBeam) {
+          stableTime += 100;
+        } else {
+          stableTime = 0;
+        }
+        lastInBeam = inBeam;
+        
+        // 更新校准进度
+        const calElapsed = (Date.now() - calibrateStart) / 1000;
+        const calProgress = Math.min(100, (calElapsed / calibrateDuration) * 100);
+        const totalProgress = (prepareDuration + calElapsed) / (prepareDuration + calibrateDuration + observeDuration + wrapDuration) * 100;
+        
+        set(state => ({
+          observationTasks: state.observationTasks.map((t, idx) =>
+            idx === i ? {
+              ...t,
+              phaseProgress: calProgress,
+              progress: Math.min(100, totalProgress),
+            } : t
+          ),
+        }));
+        
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+      
+      if (!taskQueueRunning) break;
+      
+      const currentTaskAfterCal = get().observationTasks[i];
+      if (currentTaskAfterCal?.status === 'failed') continue;
+      
+      // 校准完成，确保最终在波束内
+      const finalPointingInfo = getCurrentPointingInfo(
+        get().targetRA,
+        get().targetDec,
+        get().azimuth,
+        get().altitude
+      );
+      
+      if (!finalPointingInfo.inBeam || !finalPointingInfo.isObservable) {
+        // 再尝试一次快速校准
+        const { azimuth: tAz, altitude: tAlt } = equatorialToHorizontal(get().targetRA, get().targetDec);
+        motionState = {
+          startAz: get().azimuth,
+          startAlt: get().altitude,
+          targetAz: normalizeAzimuth(tAz),
+          targetAlt: clampAltitude(tAlt),
+          progress: 0,
+          duration: 0.5,
+        };
+        await new Promise(resolve => setTimeout(resolve, 600));
+      }
+      
+      // ========== 观测阶段：正式记录数据 ==========
       if (task.recordData && state.taskAutoRecord) {
         get().toggleRecording();
       }
       
       set(state => ({
         observationTasks: state.observationTasks.map((t, idx) =>
-          idx === i ? { ...t, startTime: Date.now() } : t
+          idx === i ? {
+            ...t,
+            currentPhase: 'observing' as const,
+            phaseProgress: 0,
+            phaseStartTimes: {
+              ...t.phaseStartTimes,
+              observing: Date.now(),
+            },
+          } : t
         ),
       }));
+      
+      set({ trackingStatus: 'tracking' });
       
       accumulatedSNR = 0;
       accumulatedSignalStrength = 0;
       peakFrequency = 0;
       taskDataPoints = 0;
+      let maxSNR = -Infinity;
+      let minSNR = Infinity;
       
-      await new Promise(resolve => setTimeout(resolve, task.duration * 1000));
+      const observeStart = Date.now();
+      
+      while (Date.now() - observeStart < observeDuration * 1000) {
+        if (!taskQueueRunning) break;
+        
+        // 持续跟踪修正
+        const currentState = get();
+        const currentTask = currentState.observationTasks[i];
+        if (!currentTask || currentTask.status !== 'running') break;
+        
+        const { azimuth: tAz, altitude: tAlt } = equatorialToHorizontal(currentTask.targetRA, currentTask.targetDec);
+        const dist = angularDistanceDeg(currentState.azimuth, currentState.altitude, tAz, tAlt);
+        
+        if (dist > TELESCOPE_CONFIG.beamWidth * 0.3) {
+          motionState = {
+            startAz: currentState.azimuth,
+            startAlt: currentState.altitude,
+            targetAz: normalizeAzimuth(tAz),
+            targetAlt: clampAltitude(tAlt),
+            progress: 0,
+            duration: Math.max(0.2, dist / TELESCOPE_CONFIG.maxSpeed / 2),
+          };
+        }
+        
+        // 收集时间序列数据
+        const snr = currentState.currentSNR;
+        if (snr > maxSNR) maxSNR = snr;
+        if (snr < minSNR) minSNR = snr;
+        
+        const obsElapsed = (Date.now() - observeStart) / 1000;
+        const obsProgress = Math.min(100, (obsElapsed / observeDuration) * 100);
+        const totalProgress = (prepareDuration + calibrateDuration + obsElapsed) / (prepareDuration + calibrateDuration + observeDuration + wrapDuration) * 100;
+        
+        // 更新时间序列数据（每秒一个数据点）
+        const dataIdx = Math.floor(obsElapsed);
+        const timeData = currentTask.timeSeriesData;
+        if (timeData && dataIdx >= timeData.timestamps.length) {
+          set(state => ({
+            observationTasks: state.observationTasks.map((t, idx) => {
+              if (idx !== i || !t.timeSeriesData) return t;
+              return {
+                ...t,
+                phaseProgress: obsProgress,
+                progress: Math.min(100, totalProgress),
+                timeSeriesData: {
+                  timestamps: [...t.timeSeriesData.timestamps, Date.now()],
+                  snr: [...t.timeSeriesData.snr, state.currentSNR],
+                  signalStrength: [...t.timeSeriesData.signalStrength, state.currentSignalStrength],
+                  pointingError: [...t.timeSeriesData.pointingError, state.pointingInfo.pointingError],
+                  quality: [...t.timeSeriesData.quality, state.observationQuality],
+                },
+              };
+            }),
+          }));
+        } else {
+          set(state => ({
+            observationTasks: state.observationTasks.map((t, idx) =>
+              idx === i ? {
+                ...t,
+                phaseProgress: obsProgress,
+                progress: Math.min(100, totalProgress),
+              } : t
+            ),
+          }));
+        }
+        
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
       
       if (!taskQueueRunning) break;
       
-      get()._completeCurrentTask();
+      // ========== 收尾阶段：停止记录，整理数据 ==========
+      set(state => ({
+        observationTasks: state.observationTasks.map((t, idx) =>
+          idx === i ? {
+            ...t,
+            currentPhase: 'wrapping' as const,
+            phaseProgress: 0,
+            phaseStartTimes: {
+              ...t.phaseStartTimes,
+              wrapping: Date.now(),
+            },
+          } : t
+        ),
+      }));
+      
+      // 停止记录
+      if (task.recordData && state.taskAutoRecord && get().isRecording) {
+        get().toggleRecording();
+      }
+      
+      // 收尾阶段：保存结果
+      const wrapStart = Date.now();
+      while (Date.now() - wrapStart < wrapDuration * 1000) {
+        if (!taskQueueRunning) break;
+        
+        const wrapElapsed = (Date.now() - wrapStart) / 1000;
+        const wrapProgress = Math.min(100, (wrapElapsed / wrapDuration) * 100);
+        const totalProgress = (prepareDuration + calibrateDuration + observeDuration + wrapElapsed) / (prepareDuration + calibrateDuration + observeDuration + wrapDuration) * 100;
+        
+        set(state => ({
+          observationTasks: state.observationTasks.map((t, idx) =>
+            idx === i ? {
+              ...t,
+              phaseProgress: wrapProgress,
+              progress: Math.min(100, totalProgress),
+            } : t
+          ),
+        }));
+        
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+      
+      if (!taskQueueRunning) break;
+      
+      // 完成任务
+      const finalResult = {
+        avgSNR: taskDataPoints > 0 ? accumulatedSNR / taskDataPoints : 0,
+        avgSignalStrength: taskDataPoints > 0 ? accumulatedSignalStrength / taskDataPoints : 0,
+        peakFrequency,
+        dataPoints: taskDataPoints,
+        maxSNR: maxSNR === -Infinity ? 0 : maxSNR,
+        minSNR: minSNR === Infinity ? 0 : minSNR,
+      };
+      
+      set(state => ({
+        observationTasks: state.observationTasks.map((t, idx) =>
+          idx === i ? {
+            ...t,
+            status: 'completed' as const,
+            progress: 100,
+            currentPhase: 'idle' as const,
+            phaseProgress: 100,
+            endTime: Date.now(),
+            result: finalResult,
+          } : t
+        ),
+      }));
     }
     
     if (taskQueueRunning) {
       taskQueueRunning = false;
-      set({ currentTaskIndex: -1 });
+      set({ currentTaskIndex: -1, trackingStatus: 'idle' });
     }
   },
   
@@ -790,15 +1085,110 @@ export const useTelescopeStore = create<TelescopeState>((set, get) => ({
         avgSignalStrength: taskDataPoints > 0 ? accumulatedSignalStrength / taskDataPoints : 0,
         peakFrequency,
         dataPoints: taskDataPoints,
+        maxSNR: 0,
+        minSNR: 0,
       };
       
       set(state => ({
         observationTasks: state.observationTasks.map((t, i) =>
           i === state.currentTaskIndex
-            ? { ...t, status: 'completed' as const, progress: 100, endTime: Date.now(), result }
+            ? { ...t, status: 'completed' as const, progress: 100, currentPhase: 'idle' as const, phaseProgress: 100, endTime: Date.now(), result }
             : t
         ),
       }));
+    }
+  },
+  
+  startReplay: (taskId: string) => {
+    const state = get();
+    const task = state.observationTasks.find(t => t.id === taskId);
+    
+    if (!task || !task.timeSeriesData || task.timeSeriesData.timestamps.length === 0) {
+      return;
+    }
+    
+    taskQueueRunning = false;
+    
+    set({
+      isReplayMode: true,
+      replayTaskId: taskId,
+      replayTime: 0,
+      replayPaused: false,
+      trackingStatus: 'tracking',
+      targetRA: task.targetRA,
+      targetDec: task.targetDec,
+      selectedStarId: task.targetStarId || null,
+    });
+  },
+  
+  stopReplay: () => {
+    set({
+      isReplayMode: false,
+      replayTaskId: null,
+      replayTime: 0,
+      replayPaused: false,
+      trackingStatus: 'idle',
+    });
+  },
+  
+  setReplayTime: (time: number) => {
+    const state = get();
+    const task = state.observationTasks.find(t => t.id === state.replayTaskId);
+    
+    if (!task || !task.timeSeriesData) return;
+    
+    const dataLength = task.timeSeriesData.timestamps.length;
+    const dataIndex = Math.min(Math.max(0, Math.floor(time)), dataLength - 1);
+    
+    if (dataIndex >= 0 && dataIndex < task.timeSeriesData.snr.length) {
+      const snr = task.timeSeriesData.snr[dataIndex];
+      const signalStrength = task.timeSeriesData.signalStrength[dataIndex];
+      const pointingError = task.timeSeriesData.pointingError[dataIndex];
+      
+      set({
+        replayTime: time,
+        currentSNR: snr,
+        currentSignalStrength: signalStrength,
+        pointingError,
+      });
+    }
+  },
+  
+  toggleReplayPause: () => {
+    const state = get();
+    set({ replayPaused: !state.replayPaused });
+  },
+  
+  updateReplay: (deltaTime: number) => {
+    const state = get();
+    if (!state.isReplayMode || state.replayPaused) return;
+    
+    const task = state.observationTasks.find(t => t.id === state.replayTaskId);
+    if (!task || !task.timeSeriesData) return;
+    
+    const dataLength = task.timeSeriesData.timestamps.length;
+    let newTime = state.replayTime + deltaTime;
+    
+    if (newTime >= dataLength) {
+      newTime = dataLength - 1;
+      set({ replayPaused: true, replayTime: newTime });
+    } else {
+      set({ replayTime: newTime });
+    }
+    
+    const dataIndex = Math.floor(newTime);
+    if (dataIndex >= 0 && dataIndex < task.timeSeriesData.snr.length) {
+      const snr = task.timeSeriesData.snr[dataIndex];
+      const signalStrength = task.timeSeriesData.signalStrength[dataIndex];
+      const pointingError = task.timeSeriesData.pointingError[dataIndex];
+      const quality = task.timeSeriesData.quality[dataIndex];
+      
+      set({
+        currentSNR: snr,
+        currentSignalStrength: signalStrength,
+        pointingError,
+        observationQuality: quality,
+      });
     }
   },
 }));
