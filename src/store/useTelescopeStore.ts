@@ -640,6 +640,7 @@ export const useTelescopeStore = create<TelescopeState>((set, get) => ({
       id: `task-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
       status: 'pending',
       progress: 0,
+      observationProgress: 0,
       currentPhase: 'idle',
       phaseProgress: 0,
       startTime: null,
@@ -657,6 +658,10 @@ export const useTelescopeStore = create<TelescopeState>((set, get) => ({
         signalStrength: [],
         pointingError: [],
         quality: [],
+        peakFrequency: [],
+        weather: [],
+        noiseFloor: [],
+        spectrum: [],
       },
     };
     
@@ -733,7 +738,7 @@ export const useTelescopeStore = create<TelescopeState>((set, get) => ({
       }
       if (!taskQueueRunning) break;
       
-      // ========== 校准阶段：确保目标稳定在波束内 ==========
+      // ========== 校准阶段：持续修正，确保目标稳定在波束内 ==========
       set(state => ({
         observationTasks: state.observationTasks.map((t, idx) =>
           idx === i ? {
@@ -750,17 +755,18 @@ export const useTelescopeStore = create<TelescopeState>((set, get) => ({
       
       set({ trackingStatus: 'calibrating' });
       
-      // 校准阶段：持续跟踪，确保目标在波束内稳定
       const calibrateStart = Date.now();
-      let stableTime = 0;
+      const maxCalibrateDuration = Math.max(calibrateDuration * 1000, 10000); // 至少10秒校准时间
+      let stableStartTime = 0;
       let lastInBeam = false;
+      let calibrationSuccessful = false;
       
-      while (Date.now() - calibrateStart < calibrateDuration * 1000) {
+      while (Date.now() - calibrateStart < maxCalibrateDuration) {
         if (!taskQueueRunning) break;
         
         const currentState = get();
         const currentTask = currentState.observationTasks[i];
-        if (!currentTask) break;
+        if (!currentTask || currentTask.status !== 'running') break;
         
         // 实时更新目标位置（因为地球自转）
         const { azimuth: targetAz, altitude: targetAlt } = equatorialToHorizontal(currentTask.targetRA, currentTask.targetDec);
@@ -781,33 +787,42 @@ export const useTelescopeStore = create<TelescopeState>((set, get) => ({
           break;
         }
         
-        // 持续修正指向
+        // 持续修正指向 - 只要有偏差就修正
         const distance = angularDistanceDeg(currentState.azimuth, currentState.altitude, targetAz, targetAlt);
-        if (distance > TELESCOPE_CONFIG.beamWidth * 0.5) {
+        if (distance > TELESCOPE_CONFIG.beamWidth * 0.3) {
           motionState = {
             startAz: currentState.azimuth,
             startAlt: currentState.altitude,
             targetAz: normalizeAzimuth(targetAz),
             targetAlt: clampAltitude(targetAlt),
             progress: 0,
-            duration: Math.max(0.3, distance / TELESCOPE_CONFIG.maxSpeed),
+            duration: Math.max(0.2, distance / TELESCOPE_CONFIG.maxSpeed / 2),
           };
           set({ trackingStatus: 'calibrating' });
+          stableStartTime = 0;
         }
         
         // 检查是否稳定在波束内
         const inBeam = currentState.pointingInfo.inBeam && currentState.pointingInfo.isObservable;
         if (inBeam && lastInBeam) {
-          stableTime += 100;
+          if (stableStartTime === 0) {
+            stableStartTime = Date.now();
+          }
         } else {
-          stableTime = 0;
+          stableStartTime = 0;
         }
         lastInBeam = inBeam;
         
+        // 如果已经稳定在波束内超过1.5秒，就可以进入观测阶段
+        if (stableStartTime > 0 && Date.now() - stableStartTime > 1500) {
+          calibrationSuccessful = true;
+          break;
+        }
+        
         // 更新校准进度
         const calElapsed = (Date.now() - calibrateStart) / 1000;
-        const calProgress = Math.min(100, (calElapsed / calibrateDuration) * 100);
-        const totalProgress = (prepareDuration + calElapsed) / (prepareDuration + calibrateDuration + observeDuration + wrapDuration) * 100;
+        const calProgress = Math.min(100, (calElapsed / (maxCalibrateDuration / 1000)) * 100);
+        const totalProgress = (prepareDuration + calElapsed) / (prepareDuration + (maxCalibrateDuration / 1000) + observeDuration + wrapDuration) * 100;
         
         set(state => ({
           observationTasks: state.observationTasks.map((t, idx) =>
@@ -827,26 +842,18 @@ export const useTelescopeStore = create<TelescopeState>((set, get) => ({
       const currentTaskAfterCal = get().observationTasks[i];
       if (currentTaskAfterCal?.status === 'failed') continue;
       
-      // 校准完成，确保最终在波束内
-      const finalPointingInfo = getCurrentPointingInfo(
-        get().targetRA,
-        get().targetDec,
-        get().azimuth,
-        get().altitude
-      );
-      
-      if (!finalPointingInfo.inBeam || !finalPointingInfo.isObservable) {
-        // 再尝试一次快速校准
-        const { azimuth: tAz, altitude: tAlt } = equatorialToHorizontal(get().targetRA, get().targetDec);
+      // 如果校准时间用完还没稳定，再做最后一次修正
+      if (!calibrationSuccessful) {
+        const { azimuth: tAz, altitude: tAlt } = equatorialToHorizontal(currentTaskAfterCal.targetRA, currentTaskAfterCal.targetDec);
         motionState = {
           startAz: get().azimuth,
           startAlt: get().altitude,
           targetAz: normalizeAzimuth(tAz),
           targetAlt: clampAltitude(tAlt),
           progress: 0,
-          duration: 0.5,
+          duration: 0.8,
         };
-        await new Promise(resolve => setTimeout(resolve, 600));
+        await new Promise(resolve => setTimeout(resolve, 1000));
       }
       
       // ========== 观测阶段：正式记录数据 ==========
@@ -914,12 +921,17 @@ export const useTelescopeStore = create<TelescopeState>((set, get) => ({
         const dataIdx = Math.floor(obsElapsed);
         const timeData = currentTask.timeSeriesData;
         if (timeData && dataIdx >= timeData.timestamps.length) {
+          const currentSpectrum = currentState.spectrumHistory.length > 0 
+            ? [...currentState.spectrumHistory[0]] 
+            : [];
+          
           set(state => ({
             observationTasks: state.observationTasks.map((t, idx) => {
               if (idx !== i || !t.timeSeriesData) return t;
               return {
                 ...t,
                 phaseProgress: obsProgress,
+                observationProgress: obsProgress,
                 progress: Math.min(100, totalProgress),
                 timeSeriesData: {
                   timestamps: [...t.timeSeriesData.timestamps, Date.now()],
@@ -927,6 +939,10 @@ export const useTelescopeStore = create<TelescopeState>((set, get) => ({
                   signalStrength: [...t.timeSeriesData.signalStrength, state.currentSignalStrength],
                   pointingError: [...t.timeSeriesData.pointingError, state.pointingInfo.pointingError],
                   quality: [...t.timeSeriesData.quality, state.observationQuality],
+                  peakFrequency: [...t.timeSeriesData.peakFrequency, peakFrequency],
+                  weather: [...t.timeSeriesData.weather, state.weather],
+                  noiseFloor: [...t.timeSeriesData.noiseFloor, state.noiseFloor],
+                  spectrum: [...t.timeSeriesData.spectrum, currentSpectrum],
                 },
               };
             }),
@@ -937,6 +953,7 @@ export const useTelescopeStore = create<TelescopeState>((set, get) => ({
               idx === i ? {
                 ...t,
                 phaseProgress: obsProgress,
+                observationProgress: obsProgress,
                 progress: Math.min(100, totalProgress),
               } : t
             ),
@@ -1144,12 +1161,42 @@ export const useTelescopeStore = create<TelescopeState>((set, get) => ({
       const snr = task.timeSeriesData.snr[dataIndex];
       const signalStrength = task.timeSeriesData.signalStrength[dataIndex];
       const pointingError = task.timeSeriesData.pointingError[dataIndex];
+      const quality = task.timeSeriesData.quality[dataIndex];
+      const peakFreq = task.timeSeriesData.peakFrequency?.[dataIndex] || state.frequency;
+      const weather = task.timeSeriesData.weather?.[dataIndex] || state.weather;
+      const noise = task.timeSeriesData.noiseFloor?.[dataIndex] || 0.1;
+      
+      // 构建回放波形
+      const waveformSamples = 256;
+      const replayWaveform = new Float32Array(waveformSamples);
+      const seed = dataIndex * 1000;
+      for (let i = 0; i < waveformSamples; i++) {
+        const t = i / waveformSamples;
+        const signal = Math.sin(t * Math.PI * 2 * 20 + seed) * signalStrength;
+        const noiseVal = (Math.sin(seed + i * 0.37) + Math.sin(seed * 1.7 + i * 0.91)) * 0.5 * noise;
+        replayWaveform[i] = signal + noiseVal;
+      }
+      
+      // 构建瀑布图历史
+      const spectrumHistory: number[][] = [];
+      const histLength = Math.min(dataIndex + 1, 128);
+      for (let i = 0; i < histLength; i++) {
+        const idx = dataIndex - histLength + 1 + i;
+        if (idx >= 0 && task.timeSeriesData.spectrum?.[idx]) {
+          spectrumHistory.push(task.timeSeriesData.spectrum[idx]);
+        }
+      }
       
       set({
         replayTime: time,
         currentSNR: snr,
         currentSignalStrength: signalStrength,
         pointingError,
+        observationQuality: quality,
+        waveformData: Array.from(replayWaveform),
+        spectrumHistory: spectrumHistory.length > 0 ? spectrumHistory : state.spectrumHistory,
+        noiseFloor: noise,
+        weather,
       });
     }
   },
@@ -1182,12 +1229,40 @@ export const useTelescopeStore = create<TelescopeState>((set, get) => ({
       const signalStrength = task.timeSeriesData.signalStrength[dataIndex];
       const pointingError = task.timeSeriesData.pointingError[dataIndex];
       const quality = task.timeSeriesData.quality[dataIndex];
+      const peakFreq = task.timeSeriesData.peakFrequency?.[dataIndex] || state.frequency;
+      const weather = task.timeSeriesData.weather?.[dataIndex] || state.weather;
+      const noise = task.timeSeriesData.noiseFloor?.[dataIndex] || 0.1;
+      
+      // 构建回放波形（基于历史强度 + 伪随机噪声，确保可重复）
+      const waveformSamples = 256;
+      const replayWaveform = new Float32Array(waveformSamples);
+      const seed = dataIndex * 1000;
+      for (let i = 0; i < waveformSamples; i++) {
+        const t = i / waveformSamples;
+        const signal = Math.sin(t * Math.PI * 2 * 20 + seed) * signalStrength;
+        const noiseVal = (Math.sin(seed + i * 0.37) + Math.sin(seed * 1.7 + i * 0.91)) * 0.5 * noise;
+        replayWaveform[i] = signal + noiseVal;
+      }
+      
+      // 构建瀑布图历史（到当前时间点为止）
+      const spectrumHistory: number[][] = [];
+      const histLength = Math.min(dataIndex + 1, 128);
+      for (let i = 0; i < histLength; i++) {
+        const idx = dataIndex - histLength + 1 + i;
+        if (idx >= 0 && task.timeSeriesData.spectrum?.[idx]) {
+          spectrumHistory.push(task.timeSeriesData.spectrum[idx]);
+        }
+      }
       
       set({
         currentSNR: snr,
         currentSignalStrength: signalStrength,
         pointingError,
         observationQuality: quality,
+        waveformData: Array.from(replayWaveform),
+        spectrumHistory: spectrumHistory.length > 0 ? spectrumHistory : state.spectrumHistory,
+        noiseFloor: noise,
+        weather,
       });
     }
   },

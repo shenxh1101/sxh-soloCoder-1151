@@ -84,6 +84,7 @@ export interface ObservationTask {
   recordData: boolean;
   status: TaskStatus;
   progress: number;
+  observationProgress: number;
   currentPhase: TaskPhase;
   phaseProgress: number;
   startTime: number | null;
@@ -101,6 +102,10 @@ export interface ObservationTask {
     signalStrength: number[];
     pointingError: number[];
     quality: number[];
+    peakFrequency: number[];
+    weather: WeatherType[];
+    noiseFloor: number[];
+    spectrum: number[][];
   };
   result?: {
     avgSNR: number;
@@ -181,7 +186,7 @@ export interface TelescopeState {
   clearWaterfall: () => void;
   exportSpectrumData: () => void;
   
-  addObservationTask: (task: Omit<ObservationTask, 'id' | 'status' | 'progress' | 'startTime' | 'endTime' | 'currentPhase' | 'phaseProgress' | 'phaseTiming' | 'phaseStartTimes'>) => void;
+  addObservationTask: (task: Omit<ObservationTask, 'id' | 'status' | 'progress' | 'observationProgress' | 'startTime' | 'endTime' | 'currentPhase' | 'phaseProgress' | 'phaseTiming' | 'phaseStartTimes' | 'timeSeriesData' | 'result' | 'error'>) => void;
   removeObservationTask: (taskId: string) => void;
   startObservationQueue: () => void;
   stopObservationQueue: () => void;

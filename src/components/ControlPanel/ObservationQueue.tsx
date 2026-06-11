@@ -194,51 +194,78 @@ export function ObservationQueue() {
     );
   };
   
-  const renderTimeSeriesChart = (task: ObservationTask) => {
+  const renderTimeSeriesCharts = (task: ObservationTask) => {
     if (!task.timeSeriesData || task.timeSeriesData.timestamps.length === 0) {
       return null;
     }
     
-    const { snr, timestamps } = task.timeSeriesData;
-    const maxSNR = Math.max(...snr, 1);
-    const minSNR = Math.min(...snr, 0);
-    const range = maxSNR - minSNR || 1;
+    const { timestamps, snr, signalStrength, pointingError, quality } = task.timeSeriesData;
+    const length = timestamps.length;
     
     const replayIdx = isReplayMode && replayTaskId === task.id 
       ? Math.floor(replayTime) 
       : -1;
     
+    const metrics = [
+      { key: 'snr', label: 'SNR', data: snr, unit: 'dB', color: '#00d4ff' },
+      { key: 'signalStrength', label: '信号强度', data: signalStrength, unit: '', color: '#00ff88' },
+      { key: 'pointingError', label: '指向误差', data: pointingError, unit: '°', color: '#ffaa00' },
+      { key: 'quality', label: '观测质量', data: quality, unit: '%', color: '#aa88ff' },
+    ];
+    
     return (
-      <div className="mt-3 pt-2 border-t border-slate-700/30">
-        <div className="text-xs font-mono text-slate-400 mb-2">SNR 时间曲线</div>
-        <div className="relative h-16 bg-slate-800/50 rounded overflow-hidden">
-          <svg className="absolute inset-0 w-full h-full" viewBox={`0 0 ${snr.length} 100`} preserveAspectRatio="none">
-            <polyline
-              fill="none"
-              stroke="rgba(0, 212, 255, 0.6)"
-              strokeWidth="0.5"
-              points={snr.map((val, i) => `${i},${100 - ((val - minSNR) / range) * 100}`).join(' ')}
-            />
-            {replayIdx >= 0 && replayIdx < snr.length && (
-              <line
-                x1={replayIdx}
-                y1="0"
-                x2={replayIdx}
-                y2="100"
-                stroke="#00ff88"
-                strokeWidth="1"
-              />
-            )}
-          </svg>
-          <div className="absolute top-1 left-2 text-[10px] font-mono text-slate-500">
-            {maxSNR.toFixed(1)} dB
-          </div>
-          <div className="absolute bottom-1 left-2 text-[10px] font-mono text-slate-500">
-            {minSNR.toFixed(1)} dB
-          </div>
-          <div className="absolute bottom-1 right-2 text-[10px] font-mono text-slate-500">
-            {timestamps.length}s
-          </div>
+      <div className="mt-3 pt-2 border-t border-slate-700/30 space-y-3">
+        <div className="text-xs font-mono text-slate-400">观测指标时间线</div>
+        
+        {metrics.map(metric => {
+          const data = metric.data;
+          if (!data || data.length === 0) return null;
+          
+          const max = Math.max(...data, 0.001);
+          const min = Math.min(...data, 0);
+          const range = max - min || 1;
+          
+          return (
+            <div key={metric.key} className="relative h-10 bg-slate-800/30 rounded overflow-hidden">
+              <svg className="absolute inset-0 w-full h-full" viewBox={`0 0 ${length} 100`} preserveAspectRatio="none">
+                <polyline
+                  fill="none"
+                  stroke={metric.color}
+                  strokeWidth="0.8"
+                  points={data.map((val, i) => `${i},${100 - ((val - min) / range) * 100}`).join(' ')}
+                />
+                {replayIdx >= 0 && replayIdx < length && (
+                  <line
+                    x1={replayIdx}
+                    y1="0"
+                    x2={replayIdx}
+                    y2="100"
+                    stroke="#ffffff"
+                    strokeWidth="0.5"
+                    strokeDasharray="2,2"
+                  />
+                )}
+              </svg>
+              <div className="absolute top-0.5 left-2 text-[9px] font-mono text-slate-500">
+                {metric.label}: {max.toFixed(metric.key === 'pointingError' ? 3 : 1)} {metric.unit}
+              </div>
+              <div className="absolute bottom-0.5 left-2 text-[9px] font-mono text-slate-500">
+                {min.toFixed(metric.key === 'pointingError' ? 3 : 1)} {metric.unit}
+              </div>
+              {replayIdx >= 0 && replayIdx < length && (
+                <div 
+                  className="absolute top-0.5 right-2 text-[9px] font-mono"
+                  style={{ color: metric.color }}
+                >
+                  当前: {data[replayIdx]?.toFixed(metric.key === 'pointingError' ? 3 : 1)} {metric.unit}
+                </div>
+              )}
+            </div>
+          );
+        })}
+        
+        <div className="text-[9px] font-mono text-slate-500 text-right">
+          共 {length} 秒数据
         </div>
       </div>
     );
@@ -507,16 +534,34 @@ export function ObservationQueue() {
                         
                         {task.status === 'running' && renderPhaseTimeline(task)}
                         
-                        {task.status === 'running' && (
-                          <div className="mt-1">
+                        {task.status === 'running' && task.currentPhase === 'observing' && (
+                          <div className="mt-2">
+                            <div className="flex justify-between text-xs font-mono text-green-400 mb-1">
+                              <span>📡 观测进度</span>
+                              <span>{task.observationProgress.toFixed(1)}%</span>
+                            </div>
+                            <div className="h-2 bg-slate-700 rounded-full overflow-hidden">
+                              <div
+                                className="h-full bg-gradient-to-r from-green-600 to-green-400 transition-all duration-100"
+                                style={{ width: `${task.observationProgress}%` }}
+                              />
+                            </div>
+                            <div className="text-[10px] font-mono text-slate-500 mt-1 text-right">
+                              已观测 {Math.floor(task.observationProgress / 100 * task.duration)}s / {task.duration}s
+                            </div>
+                          </div>
+                        )}
+                        
+                        {task.status === 'running' && task.currentPhase !== 'observing' && (
+                          <div className="mt-2">
                             <div className="flex justify-between text-xs font-mono text-slate-400 mb-1">
-                              <span>总进度</span>
-                              <span>{task.progress.toFixed(1)}%</span>
+                              <span>{PHASE_LABELS[task.currentPhase]}...</span>
+                              <span>{task.phaseProgress.toFixed(0)}%</span>
                             </div>
                             <div className="h-1.5 bg-slate-700 rounded-full overflow-hidden">
                               <div
-                                className="h-full bg-gradient-to-r from-cyan-500 to-green-500 transition-all duration-100"
-                                style={{ width: `${task.progress}%` }}
+                                className={`h-full ${PHASE_COLORS[task.currentPhase]} transition-all duration-100`}
+                                style={{ width: `${task.phaseProgress}%` }}
                               />
                             </div>
                           </div>
@@ -541,7 +586,7 @@ export function ObservationQueue() {
                           </div>
                         )}
                         
-                        {isExpanded && task.status === 'completed' && renderTimeSeriesChart(task)}
+                        {isExpanded && task.status === 'completed' && renderTimeSeriesCharts(task)}
                         
                         {isReplayingThis && task.timeSeriesData && (
                           <div className="mt-3 pt-2 border-t border-purple-500/30">
