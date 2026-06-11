@@ -24,6 +24,8 @@ export function Waterfall({ className }: WaterfallProps) {
   const waterfallStartTime = useTelescopeStore(state => state.waterfallStartTime);
   const pointingInfo = useTelescopeStore(state => state.pointingInfo);
   const trackingStatus = useTelescopeStore(state => state.trackingStatus);
+  const isReplayMode = useTelescopeStore(state => state.isReplayMode);
+  const replayPeakFrequency = useTelescopeStore(state => state.replayPeakFrequency);
   
   const toggleWaterfallPause = useTelescopeStore(state => state.toggleWaterfallPause);
   const clearWaterfall = useTelescopeStore(state => state.clearWaterfall);
@@ -55,9 +57,16 @@ export function Waterfall({ className }: WaterfallProps) {
   }, []);
   
   const peakInfo = useMemo(() => {
+    if (isReplayMode && replayPeakFrequency > 0) {
+      return {
+        frequency: replayPeakFrequency,
+        amplitude: 1,
+        binIndex: 0,
+      };
+    }
     if (spectrumHistory.length === 0 || !spectrumHistory[0]) return null;
     return findPeakFrequency(spectrumHistory[0], frequencyRange.min, frequencyRange.max);
-  }, [spectrumHistory, frequencyRange]);
+  }, [spectrumHistory, frequencyRange, isReplayMode, replayPeakFrequency]);
   
   useEffect(() => {
     const canvas = canvasRef.current;

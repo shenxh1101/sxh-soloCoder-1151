@@ -120,6 +120,8 @@ export const useTelescopeStore = create<TelescopeState>((set, get) => ({
   replayTaskId: null,
   replayTime: 0,
   replayPaused: false,
+  replayPeakFrequency: 0,
+  realtimeSnapshot: null,
   
   setPointing: (az: number, alt: number) => {
     const targetAz = normalizeAzimuth(az);
@@ -490,6 +492,11 @@ export const useTelescopeStore = create<TelescopeState>((set, get) => ({
   
   updateSignalData: () => {
     const state = get();
+    
+    if (state.isReplayMode) {
+      return;
+    }
+    
     const now = performance.now();
     const delta = (now - lastUpdateTime) / 1000;
     lastUpdateTime = now;
@@ -715,7 +722,12 @@ export const useTelescopeStore = create<TelescopeState>((set, get) => ({
         ? await get().setTargetByStar(ALL_STARS.find(s => s.id === task.targetStarId)!)
         : await get().setTargetByRADec(task.targetRA, task.targetDec);
       
-      if (!slewResult.success) {
+      // 检查目标当前是否可观测（哪怕转向过程中已经偏出波束）
+      const { altitude: currentTargetAlt } = equatorialToHorizontal(task.targetRA, task.targetDec);
+      const targetIsObservable = currentTargetAlt >= TELESCOPE_CONFIG.minAltitude && currentTargetAlt <= TELESCOPE_CONFIG.maxAltitude;
+      
+      // 只有目标不可观测时才标记失败，否则继续进入校准阶段持续修正
+      if (!slewResult.success && !targetIsObservable) {
         set(state => ({
           observationTasks: state.observationTasks.map((t, idx) =>
             idx === i ? {
@@ -1126,11 +1138,30 @@ export const useTelescopeStore = create<TelescopeState>((set, get) => ({
     
     taskQueueRunning = false;
     
+    const realtimeSnapshot = {
+      waveformData: [...state.waveformData],
+      spectrumHistory: state.spectrumHistory.map(s => [...s]),
+      currentSignalStrength: state.currentSignalStrength,
+      currentSNR: state.currentSNR,
+      noiseFloor: state.noiseFloor,
+      observationQuality: state.observationQuality,
+      pointingError: state.pointingError,
+      weather: state.weather,
+      trackingStatus: state.trackingStatus,
+      azimuth: state.azimuth,
+      altitude: state.altitude,
+      targetRA: state.targetRA,
+      targetDec: state.targetDec,
+      selectedStarId: state.selectedStarId,
+    };
+    
     set({
       isReplayMode: true,
       replayTaskId: taskId,
       replayTime: 0,
       replayPaused: false,
+      replayPeakFrequency: task.result?.peakFrequency || 0,
+      realtimeSnapshot,
       trackingStatus: 'tracking',
       targetRA: task.targetRA,
       targetDec: task.targetDec,
@@ -1139,13 +1170,43 @@ export const useTelescopeStore = create<TelescopeState>((set, get) => ({
   },
   
   stopReplay: () => {
-    set({
-      isReplayMode: false,
-      replayTaskId: null,
-      replayTime: 0,
-      replayPaused: false,
-      trackingStatus: 'idle',
-    });
+    const state = get();
+    const snapshot = state.realtimeSnapshot;
+    
+    if (snapshot) {
+      set({
+        isReplayMode: false,
+        replayTaskId: null,
+        replayTime: 0,
+        replayPaused: false,
+        replayPeakFrequency: 0,
+        realtimeSnapshot: null,
+        waveformData: snapshot.waveformData,
+        spectrumHistory: snapshot.spectrumHistory,
+        currentSignalStrength: snapshot.currentSignalStrength,
+        currentSNR: snapshot.currentSNR,
+        noiseFloor: snapshot.noiseFloor,
+        observationQuality: snapshot.observationQuality,
+        pointingError: snapshot.pointingError,
+        weather: snapshot.weather,
+        trackingStatus: snapshot.trackingStatus,
+        azimuth: snapshot.azimuth,
+        altitude: snapshot.altitude,
+        targetRA: snapshot.targetRA,
+        targetDec: snapshot.targetDec,
+        selectedStarId: snapshot.selectedStarId,
+      });
+    } else {
+      set({
+        isReplayMode: false,
+        replayTaskId: null,
+        replayTime: 0,
+        replayPaused: false,
+        replayPeakFrequency: 0,
+        realtimeSnapshot: null,
+        trackingStatus: 'idle',
+      });
+    }
   },
   
   setReplayTime: (time: number) => {
@@ -1197,6 +1258,7 @@ export const useTelescopeStore = create<TelescopeState>((set, get) => ({
         spectrumHistory: spectrumHistory.length > 0 ? spectrumHistory : state.spectrumHistory,
         noiseFloor: noise,
         weather,
+        replayPeakFrequency: peakFreq,
       });
     }
   },
@@ -1263,6 +1325,7 @@ export const useTelescopeStore = create<TelescopeState>((set, get) => ({
         spectrumHistory: spectrumHistory.length > 0 ? spectrumHistory : state.spectrumHistory,
         noiseFloor: noise,
         weather,
+        replayPeakFrequency: peakFreq,
       });
     }
   },

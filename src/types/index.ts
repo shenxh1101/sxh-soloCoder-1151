@@ -168,6 +168,23 @@ export interface TelescopeState {
   replayTaskId: string | null;
   replayTime: number;
   replayPaused: boolean;
+  replayPeakFrequency: number;
+  realtimeSnapshot: {
+    waveformData: number[];
+    spectrumHistory: number[][];
+    currentSignalStrength: number;
+    currentSNR: number;
+    noiseFloor: number;
+    observationQuality: number;
+    pointingError: number;
+    weather: WeatherType;
+    trackingStatus: TrackingStatus;
+    azimuth: number;
+    altitude: number;
+    targetRA: number;
+    targetDec: number;
+    selectedStarId: string | null;
+  } | null;
   
   setPointing: (az: number, alt: number) => void;
   setTargetByRADec: (ra: number, dec: number) => Promise<{ success: boolean; message?: string }>;
